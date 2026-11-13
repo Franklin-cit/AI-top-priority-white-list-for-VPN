@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.bak
+.pytest_cache/
+tmp_*/
+out_*.conf
+out_*.yaml
