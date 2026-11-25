@@ -3,5 +3,15 @@ __pycache__/
 *.bak
 .pytest_cache/
 tmp_*/
+*.metadb
+dlc.dat_plain.yml
+*.sha256sum
+domain-list-community/
+run.log
+subscription_hardener_last_failed/
 out_*.conf
 out_*.yaml
+output-*.conf
+output-*.yaml
+shadowrocket-*.conf
+flclash*.yaml

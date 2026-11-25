@@ -47,24 +47,58 @@ DEFAULT_PROXY_PROBES = (
     "groq.com",
     "midjourney.com",
     "cursor.com",
+    "hatch.metaaivm.com",
+    "kimi.ai",
+    "moonshot.ai",
+    "minimax.io",
+    "zoom.us",
+    "www.ieee.org",
+    "www.alibabacloud.com",
+    "api.binance.com",
+    "www.okx.com",
+    "www.oklink.com",
     "1ms.dog",
     "ipqs.com",
+    "api.ipquery.io",
     "ipinfo.io",
     "iplocate.io",
+    "p19-oec-general.ttcdn-us.com",
+    "tv.apple.com",
+    "video-stats.video.google.com",
+    "graph.instagram.com",
 )
 DEFAULT_DIRECT_PROBES = (
     "baidu.com",
     "www.taobao.com",
-    "ieee.org",
     "cn.bing.com",
     "www.microsoft.com",
+    "ctldl.windowsupdate.com",
+    "update.microsoft.com",
+    "www.office.com",
     "login.live.com",
-    "amazon.cn",
+    "www.msftconnecttest.com",
+    "www.msftncsi.com",
+    "aweme.snssdk.com",
+    "data.bilibili.com",
+    "httpdns.bilivideo.com",
+    "dns.weixin.qq.com.cn",
+    "www.amazon.cn",
     "amazonaws.cn",
     "yuque.com",
+    "www.coolapk.com",
+    "www.bbdc.cn",
+    "bubei.com.cn",
     "deepseek.com",
     "doubao.com",
     "kimi.com",
+    "moonshot.cn",
+    "www.minimaxi.com",
+    "qwen.ai",
+    "yiyan.baidu.com",
+    "api.mijia.tech",
+    "fp-it.fengkongcloud.com",
+    "api-verify.dutils.com",
+    "api.open.weshineapp.com",
 )
 DEFAULT_REJECT_PROBES = (
     "doubleclick.net",
@@ -74,11 +108,55 @@ DEFAULT_REJECT_PROBES = (
     "googlesyndication.com",
     "adservice.google.com",
     "analytics.google.com",
+    "crashlyticsreports-pa.googleapis.com",
+    "clientmetrics-pa.googleapis.com",
+    "imasdk.googleapis.com",
+    "pagead.l.google.com",
     "googlesyndication-cn.com",
+    "ipv6.msftconnecttest.com",
+    "app-analytics-services.com",
+    "app-ads-services.com",
+    "sdk.e.qq.com",
+    "ios.bugly.qq.com",
+    "stun.chat.bilibili.com",
+    "oslogs.umeng.com",
+    "vc-brain-lf.ndcpp.com",
+    "status-ipv6.jpush.cn",
+    "api-c.dutils.com",
+    "cnlogs.umengcloud.com",
+    "dvzqy5r8qco96.v1d.pkoplink.com",
+    "browser-intake-datadoghq.com",
+    "browser-intake-us5-datadoghq.com",
+    "http-intake.logs.us5.datadoghq.com",
+    "o33249.ingest.sentry.io",
+    "o33249.ingest.us.sentry.io",
+    "o1158394.ingest.us.sentry.io",
+    "copilot-telemetry-service.githubusercontent.com",
+    "copilot-telemetry.githubusercontent.com",
+    "openai.qualtrics.com",
+    "api.segment.io",
+    "cdn.segment.com",
+    "api-access.pangolin-sdk-toutiao.com",
+    "csjplatform.com",
+    "tjdl02.ankltoken.com",
+    "orzonera.yingt.fun",
+    "applog.zijieapi.com",
+    "log.snssdk.com",
+    "apmplus.volces.com",
+    "unitelogreport.reader.qq.com",
+    "dw-online.ksosoft.com",
+    "shuc-android.ksord.com",
+    "pre-api.miui.security.xiaomi.com",
+    "tracking.crazyegg.com",
+    "media.ethicalads.io",
+    "track.hsadspixel.net",
+    "js.hs-analytics.net",
+    "collect.wpsmail.net",
 )
 
 _LOG_MATCH_RE = re.compile(r"\[TCP\] .+ --> ([^ ]+)(?: \([^)]+\))? match (.+?) using ([^\r\n\"]+)")
 _GEOIP_DB_URL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"
+_ASN_DB_URL = "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
 
 
 def _strip_comments_and_quotes(val: str) -> str:
@@ -149,6 +227,13 @@ def prepare_env(yaml_path: pathlib.Path, env_dir: pathlib.Path, proxy_url: str |
     print(f"[PREP] Downloading geoip.metadb -> {geoip_dest}")
     _download(_GEOIP_DB_URL, geoip_dest)
 
+    asn_dest = env_dir / "ASN.mmdb"
+    print(f"[PREP] Downloading ASN.mmdb -> {asn_dest}")
+    try:
+        _download(_ASN_DB_URL, asn_dest)
+    except Exception as exc:
+        print(f"[WARN] Failed to download ASN.mmdb ({exc}); IP-ASN rules may require manual ASN.mmdb placement")
+
     providers = extract_provider_urls(yaml_path.read_text(encoding="utf-8", errors="replace"))
     print(f"[PREP] Found {len(providers)} remote rule-providers")
     for name, (url, rel_path) in providers.items():
@@ -165,14 +250,29 @@ def check_no_active_proxy() -> list[str]:
     """Warn if active local FlClash/Clash processes or system proxy settings could skew tests."""
     warnings: list[str] = []
     if os.name == "nt":
-        proc = subprocess.run(
-            ["tasklist", "/NH"],
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
-        low = (proc.stdout or "").lower()
-        if "flclash.exe" in low or "flclashcore.exe" in low:
+        low = ""
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Get-Process flclash* -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+            )
+            low = (proc.stdout or "").lower()
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc = subprocess.run(
+                    ["tasklist", "/NH"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=3,
+                )
+                low = (proc.stdout or "").lower()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if "flclash" in low:
             warnings.append("Detected running FlClash.exe / FlClashCore.exe process")
         try:
             import winreg
@@ -189,7 +289,10 @@ def check_no_active_proxy() -> list[str]:
             pass
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         if os.environ.get(var):
-            warnings.append(f"Environment variable {var}={os.environ[var]} is set")
+            warnings.append(
+                f"Environment variable {var}={os.environ[var]} is set "
+                "(may come from a terminal/sandbox proxy rather than FlClash; unset it in this shell or pass --allow-active-proxy)"
+            )
     return warnings
 
 
@@ -218,6 +321,27 @@ def build_safe_runtime_yaml(src_text: str, test_port: int, ctrl_addr: str, secre
             in_tun = top_key == "tun"
             if top_key == "tun":
                 tun_found = True
+                if top_val.startswith("{"):
+                    if re.search(r"(?:^|[\s,{])enable\s*:", raw):
+                        patched = re.sub(
+                            r"((?:^|[\s,{])enable\s*:\s*)(?:true|false)",
+                            r"\1false",
+                            raw,
+                            count=1,
+                            flags=re.I,
+                        )
+                    else:
+                        idx = raw.rfind("}")
+                        if idx != -1:
+                            before = raw[:idx].rstrip()
+                            sep = "" if before.endswith("{") else ", "
+                            patched = f"{before}{sep}enable: false{raw[idx:]}"
+                        else:
+                            patched = raw
+                    out.append(patched)
+                    in_tun = False
+                    tun_enable_set = True
+                    continue
                 out.append(raw)
                 tun_header_idx = len(out) - 1
                 continue
@@ -273,7 +397,9 @@ def _http_json(url: str, secret: str, timeout: float = 5.0) -> dict:
     req = urllib.request.Request(url)
     if secret:
         req.add_header("Authorization", f"Bearer {secret}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    # Never route local loopback Mihomo controller traffic through HTTP_PROXY/HTTPS_PROXY
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -324,6 +450,21 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _yaml_section_has_enable_true(yaml_text: str, section: str) -> bool:
+    """Return True if the specified top-level YAML block contains `enable: true`."""
+    in_section = False
+    for raw in yaml_text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if not raw[0].isspace() and ":" in raw:
+            in_section = raw.split(":", 1)[0].strip() == section
+            continue
+        if in_section and re.match(r"^\s+enable\s*:\s*true\b", raw):
+            return True
+    return False
+
+
 def verify_runtime(
     config_path: pathlib.Path,
     mihomo_bin: str,
@@ -364,8 +505,10 @@ def verify_runtime(
         runtime_yaml = build_safe_runtime_yaml(src_text, test_port, ctrl_addr, secret)
 
         # Sanity assert dns.enable and sniffer.enable were NOT accidentally flipped off
-        if "enhanced-mode: fake-ip" in src_text and not re.search(r"^\s+enable:\s*true\b", runtime_yaml, re.M):
-            raise RuntimeError("Safety guard tripped: dns/sniffer enable: true missing in runtime YAML")
+        if _yaml_section_has_enable_true(src_text, "dns") and not _yaml_section_has_enable_true(runtime_yaml, "dns"):
+            raise RuntimeError("Safety guard tripped: dns.enable: true missing in runtime YAML")
+        if _yaml_section_has_enable_true(src_text, "sniffer") and not _yaml_section_has_enable_true(runtime_yaml, "sniffer"):
+            raise RuntimeError("Safety guard tripped: sniffer.enable: true missing in runtime YAML")
 
         runtime_file = workdir / "runtime.yaml"
         runtime_file.write_text(runtime_yaml, encoding="utf-8")
@@ -383,10 +526,16 @@ def verify_runtime(
 
         log_path = workdir / "run.log"
         log_fh = log_path.open("w", encoding="utf-8", errors="replace")
+        child_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
         proc = subprocess.Popen(
             [mihomo_bin, "-f", str(runtime_file), "-d", str(workdir)],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
+            env=child_env,
         )
         try:
             deadline = time.time() + 60.0

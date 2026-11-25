@@ -1,64 +1,79 @@
 #!/usr/bin/env python3
-"""Deterministic builder, cleaner, and action-scoped deduplicator for hardened subscriptions.
+"""Deterministic, zero-airport-rule builder driven by v2fly/domain-list-community.
 
-Supports both divergent platforms cleanly:
-- Shadowrocket (--mode sr): iOS .conf with Lite/Full profiles, Apple Situation A (US-only
-  AI/News/TV+ proxy + App Store/iCloud direct), QQ/WeChat UDP whitelist + QUIC block,
-  235 domestic non-.cn + CDN rules, pure LF, no hardcoded [Proxy].
-- FlClash / Mihomo (--mode flclash): Windows/Android .yaml hardening from an arbitrary
-  airport base config, preserving proxies, proxy-groups, and specialized non-main group
-  routes, fixing DNS/Sniffer/behavior, deduplicating ads, and checking proxy-groups.
-
-All domain checks use strict DNS label boundaries and action-scoped deduplication so
-cross-action exceptions (Scheme B Google REJECT, cn.bing.com, GitHub HK avatars,
-iOS US-only Apple) are never swallowed silently.
+Supports both platforms from a single DLC + Delta source of truth:
+- Shadowrocket (--mode sr): iOS .conf (Full profile, Apple Situation A: US-only
+  Intelligence/News/TV+/SafeBrowsing OHTTP proxy + App Store/iCloud direct), Layer 1.5
+  Tencent ad UDP pre-reject + QQ/WeChat UDP whitelist + QUIC/PCDN block, lightweight
+  high-precision DLC + telemetry REJECT, DLC geolocation-!cn overseas backbone, cleaned
+  DLC cn + auto-subtracted Delta, hardened [General] DNS (#no-h3), pure LF.
+- FlClash / Mihomo (--mode flclash): Win/Android single-file inline .yaml preserving ONLY
+  proxies and proxy-groups from --base, stripping all remote HTTP rule-providers and
+  replacing private/cn-domain with native Mihomo `type: inline, behavior: domain`
+  providers for DNS fake-ip-filter / nameserver-policy + zero external file dependencies.
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import pathlib
 import re
 import sys
-import time
-import urllib.request
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from audit_subscription import (  # noqa: E402
+    AUTO_TEST_GROUP_TYPES,
+    _extract_proxy_entries,
     _extract_proxy_group_names,
     _extract_yaml_top_blocks,
+    _parse_proxy_group_entries,
+    _parse_proxy_provider_entries,
+    _replace_flow_bracket_list,
+    _split_inline_comment,
     _strip_inline_comment,
-    _strip_yaml_quotes,
     audit_flclash,
     audit_shadowrocket,
     format_report,
 )
+from dlc_catalog import DlcCatalog, DlcEntry, fetch_dlc_plain  # noqa: E402
 from rule_catalog import (  # noqa: E402
     AI_PROTECTED_EXACT,
     AI_PROTECTED_SUFFIXES,
+    AMAZON_CN_DIRECT,
     ANTHROPIC_EXACT_DOMAINS,
     ANTHROPIC_KEYWORDS,
     ANTHROPIC_SUFFIXES,
     APPLE_CIDRS_V4,
     APPLE_CIDRS_V6,
     APPLE_COMMON_SUFFIXES,
+    APPLE_SAFEBROWSING_OHTTP_SUFFIXES,
     APPLE_SR_DIRECT_EXTRA_SUFFIXES,
     APPLE_SR_DIRECT_KEYWORDS,
     APPLE_SR_US_ONLY_SUFFIXES,
     BUILTIN_MIHOMO_ACTIONS,
-    BYTEDANCE_COMMON_SUFFIXES,
-    CHECKER_DOMAINS_36,
-    CN_DOMESTIC_AI_SUFFIXES,
+    BYTEDANCE_CN_DELTA_SUFFIXES,
+    CHECKER_DELTA_DOMAINS,
+    CN_DOMESTIC_AI_DELTA_SUFFIXES,
+    CN_DOMESTIC_DELTA_SUFFIXES,
     CN_DOMESTIC_DEV_EXTRA,
     CORE_AD_SUFFIXES,
+    DLC_CN_EXCLUDED_DOMAINS,
     FLCLASH_DEFAULT_NAMESERVER,
+    FLCLASH_DNS_AD_REJECT_EXACT,
+    FLCLASH_DNS_AD_REJECT_SUFFIXES,
+    FLCLASH_DNS_ARPA_SUFFIXES,
     FLCLASH_DOMESTIC_DOH,
     FLCLASH_FAKE_IP_FILTER_BASE,
+    FLCLASH_NCSI_DIRECT_SUFFIXES,
+    FLCLASH_NCSI_IPV6_REJECT,
+    FLCLASH_OVERSEAS_DOH_BASES,
     FLCLASH_PROXY_SERVER_NAMESERVER,
     FLCLASH_SNIFFER_SKIP,
+    FLCLASH_TENCENT_UDP_PROCESSES,
     GOOGLE_AI_AND_PARENT_SUFFIXES,
     GOOGLE_AI_KEYWORDS,
     GOOGLE_CN_AD_VARIANTS,
@@ -66,6 +81,9 @@ from rule_catalog import (  # noqa: E402
     LAN_IPV4_CIDRS,
     LAN_IPV6_CIDRS,
     LAN_SUFFIXES,
+    LAYER3_AD_EXEMPT_DOMAINS,
+    LAYER3_EXACT_REJECT_DOMAINS,
+    LAYER3_TELEMETRY_REJECT_DOMAINS,
     LAYER7_REMOVED_KEYWORDS,
     LAYER25_PROTECTION_SUFFIXES,
     META_ASNS,
@@ -82,20 +100,15 @@ from rule_catalog import (  # noqa: E402
     OPENAI_KEYWORDS,
     OPENAI_SUFFIXES,
     OTHER_AI_SUFFIXES,
-    PLATFORM_41_TWITTER,
-    PLATFORM_42_YOUTUBE,
-    PLATFORM_43_META_SOCIAL,
-    PLATFORM_44_MSG,
-    PLATFORM_45_DEV_COMMUNITY,
-    PLATFORM_46_STREAMING,
-    PROVIDER_EXPECTED_BEHAVIOR,
-    PUBLIC_SR_WHITELIST_URL,
+    OVERSEAS_PROXY_DELTA_DOMAINS,
+    PLATFORM_44_LOG_VERIFIED_DELTAS,
+    SCHEME_B_EXEMPT_DOMAINS,
     SCHEME_B_GOOGLE_REJECT_DOMAINS,
-    SR_CN_NON_CN_235,
-    SR_DIRECT_SKIP_EXACT,
     SR_GENERAL_LINES,
-    SR_LAN_INLINE_DOMAINS,
-    SR_LAN_INLINE_SUFFIXES,
+    SR_PCDN_NOISE_EXACT,
+    SR_PCDN_NOISE_KEYWORDS,
+    SR_PCDN_NOISE_SUFFIXES,
+    SR_TENCENT_UDP_REJECT_SUFFIXES,
     SR_TENCENT_UDP_SUFFIXES,
     XAI_SUFFIXES,
     domain_in_suffix_set,
@@ -103,21 +116,32 @@ from rule_catalog import (  # noqa: E402
 
 IP_NO_RESOLVE_TYPES = {"IP-CIDR", "IP-CIDR6", "IP-ASN", "GEOIP"}
 
+_DLC_AD_VENDOR_LISTS = (
+    "google",
+    "bytedance",
+    "tencent",
+    "xiaomi",
+    "apple",
+    "baidu",
+    "alibaba",
+    "meta",
+    "microsoft",
+    "netease",
+    "jd",
+    "iqiyi",
+    "kuaishou",
+    "bilibili",
+    "qihoo360",
+)
 
-def _flclash_ruleset_rule(
-    rs_name: str,
-    action: str,
-    provider_behaviors: dict[str, str] | None = None,
-) -> str:
-    """Format a FlClash RULE-SET line with ',no-resolve' for ipcidr and classical sets."""
-    beh = (
-        PROVIDER_EXPECTED_BEHAVIOR.get(rs_name)
-        or (provider_behaviors or {}).get(rs_name)
-        or ("ipcidr" if rs_name.lower() in {"cn-ip", "geoip-cn"} else "classical")
-    )
-    if beh != "domain":
-        return f"RULE-SET,{rs_name},{action},no-resolve"
-    return f"RULE-SET,{rs_name},{action}"
+
+def _normalize_cidr(value: str) -> tuple[str, str] | None:
+    """Return canonical (IP-CIDR|IP-CIDR6, network_str) with host bits masked off."""
+    try:
+        net = ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError:
+        return None
+    return ("IP-CIDR6" if net.version == 6 else "IP-CIDR", str(net))
 
 
 class RuleEmitter:
@@ -141,8 +165,10 @@ class RuleEmitter:
     def _format_rule(self, rule_text: str) -> str:
         if self.platform == "sr":
             return rule_text
-        escaped = rule_text.replace('"', '\\"')
-        return f'  - "{escaped}"'
+        if "\\" in rule_text or '"' in rule_text:
+            escaped = rule_text.replace("'", "''")
+            return f"  - '{escaped}'"
+        return f'  - "{rule_text}"'
 
     def add_raw(self, rule_text: str) -> None:
         self.lines.append(self._format_rule(rule_text))
@@ -163,10 +189,13 @@ class RuleEmitter:
             return False
         if self.platform == "sr" and t == "PROCESS-NAME":
             return False
-        if t == "IP-CIDR" and ":" in v:
-            t = "IP-CIDR6"
+        if t in {"IP-CIDR", "IP-CIDR6"}:
+            norm = _normalize_cidr(v)
+            if not norm:
+                return False
+            t, v = norm
 
-        v_low = v.lower()
+        v_low = v if t == "DOMAIN-REGEX" else v.lower()
         act_low = act.lower()
         key = (t, v_low)
 
@@ -180,7 +209,6 @@ class RuleEmitter:
             return False
 
         # Guardrail 1: only deduplicate child domains against an ancestor with the SAME action.
-        # Different-action ancestors are logged cleanly instead of silently eating exceptions.
         if t in {"DOMAIN", "DOMAIN-SUFFIX"}:
             parts = v_low.strip(".").split(".")
             for i in range(len(parts)):
@@ -208,157 +236,22 @@ class RuleEmitter:
         return True
 
 
-def fetch_sr_whitelist(dest: pathlib.Path, url: str = PUBLIC_SR_WHITELIST_URL) -> pathlib.Path:
-    """Download public upstream Shadowrocket whitelist conf when explicitly requested."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": "subscription-hardener/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = resp.read()
-    if len(data) < 10_000 or b"[Rule]" not in data:
-        raise ValueError(f"Downloaded upstream whitelist looks invalid ({len(data)} bytes)")
-    dest.write_bytes(data)
-    return dest
-
-
-def parse_sr_upstream(
-    sr_path: pathlib.Path,
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
-    """Parse upstream Shadowrocket [Rule] entries into (reject_dom, reject_ip, direct, proxy)."""
-    reject_dom: list[tuple[str, str]] = []
-    reject_ip: list[tuple[str, str]] = []
-    direct: list[tuple[str, str]] = []
-    proxy: list[tuple[str, str]] = []
-
-    in_rule = False
-    for raw in sr_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        s = raw.strip()
-        if s == "[Rule]":
-            in_rule = True
-            continue
-        if s.startswith("[") and s.endswith("]"):
-            in_rule = False
-            continue
-        if not in_rule or not s or s.startswith(("#", ";")):
-            continue
-        parts = [p.strip() for p in s.split(",")]
-        if len(parts) < 3:
-            continue
-        typ = parts[0].upper()
-        if parts[-1].lower() == "no-resolve":
-            parts = parts[:-1]
-        if len(parts) < 3:
-            continue
-        act = parts[-1].lower()
-        val = ",".join(parts[1:-1]).strip()
-        if typ in {"RULE-SET", "GEOIP", "FINAL", "MATCH", "URL-REGEX", "USER-AGENT"}:
-            continue
-        if typ in {"IP-CIDR", "IP-CIDR6"}:
-            ip_typ = "IP-CIDR6" if ":" in val else "IP-CIDR"
-            pair = (ip_typ, val)
-            if act.startswith("reject"):
-                reject_ip.append(pair)
-            elif act == "direct":
-                direct.append(pair)
-            elif act == "proxy":
-                proxy.append(pair)
-        else:
-            pair = (typ, val.lower())
-            if act.startswith("reject"):
-                reject_dom.append(pair)
-            elif act == "direct":
-                direct.append(pair)
-            elif act == "proxy":
-                proxy.append(pair)
-
-    return (
-        list(dict.fromkeys(reject_dom)),
-        list(dict.fromkeys(reject_ip)),
-        list(dict.fromkeys(direct)),
-        list(dict.fromkeys(proxy)),
-    )
-
-
-def load_ads_domain_set(ads_path: pathlib.Path) -> tuple[set[str], set[str], list[str]]:
-    """Load Clash ads ruleset (behavior: domain) and warn if cached file is older than 7 days."""
-    warnings: list[str] = []
-    age_days = (time.time() - ads_path.stat().st_mtime) / 86400.0
-    if age_days > 7.0:
-        warnings.append(
-            f"ads ruleset '{ads_path}' is {age_days:.1f} days old; consider refreshing before deduplication"
-        )
-    suffixes: set[str] = set()
-    exact: set[str] = set()
-    for raw in ads_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        s = raw.strip()
-        if not s.startswith("- "):
-            continue
-        val = s[2:].strip().strip("'\"").lower()
-        if val.startswith("+."):
-            suffixes.add(val[2:])
-        elif val.startswith("."):
-            suffixes.add(val[1:])
-        elif val:
-            exact.add(val)
-    return suffixes, exact, warnings
-
-
-def is_in_ads_set(typ: str, val: str, ads_suffixes: set[str], ads_exact: set[str]) -> bool:
-    v = val.lower()
-    if typ == "DOMAIN-KEYWORD":
-        return False
-    if v in ads_exact or v in ads_suffixes:
-        return True
-    return domain_in_suffix_set(v, ads_suffixes)
-
-
-_INLINE_RULESET_TYPES = {"DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "IP-CIDR", "IP-CIDR6", "IP-ASN", "GEOIP"}
-
-
-def load_clash_ruleset_entries(path: pathlib.Path) -> list[tuple[str, str]]:
-    """Load Clash ruleset YAML (classical or domain) into normalized (TYPE, VALUE) tuples."""
-    if not path.is_file():
-        return []
-    out: list[tuple[str, str]] = []
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        s = raw.strip()
-        if not s.startswith("- "):
-            continue
-        val = s[2:].strip().strip("'\"")
-        if "," in val:
-            parts = [p.strip() for p in val.split(",")]
-            typ = parts[0].upper()
-            v = parts[1]
-            if typ not in _INLINE_RULESET_TYPES:
-                continue
-            if typ in {"IP-CIDR", "IP-CIDR6"}:
-                typ = "IP-CIDR6" if ":" in v else "IP-CIDR"
-            elif typ in {"DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD"}:
-                v = v.lower()
-            out.append((typ, v))
-        else:
-            v = val.lower()
-            if v.startswith("+."):
-                out.append(("DOMAIN-SUFFIX", v[2:]))
-            elif v.startswith("."):
-                out.append(("DOMAIN-SUFFIX", v[1:]))
-            elif v:
-                out.append(("DOMAIN", v))
-    return out
-
-
 def is_ai_protected_reject_candidate(typ: str, val: str) -> bool:
-    """Guardrail 2: strict DNS label-boundary protection for AI domains in Layer 3."""
+    """Guardrail 2: strict DNS label-boundary protection for L2 AI & companion domains."""
     v = val.lower()
     if typ == "DOMAIN-KEYWORD":
         return v in set(OPENAI_KEYWORDS) | set(ANTHROPIC_KEYWORDS) | set(GOOGLE_AI_KEYWORDS)
+    if typ == "DOMAIN-REGEX":
+        return False
     if v in AI_PROTECTED_EXACT:
         return True
     return domain_in_suffix_set(v, AI_PROTECTED_SUFFIXES)
 
 
 def is_apple_direct_for_sr_a(typ: str, val: str) -> bool:
-    """Strict label-boundary check for generic Apple CDN entries filtered from SR Situation A Layer 7."""
+    """Strict label-boundary check for generic Apple CDN entries filtered from L7 under Apple A."""
     apple_roots = {
+        "apple",
         *APPLE_COMMON_SUFFIXES,
         *APPLE_SR_DIRECT_EXTRA_SUFFIXES,
         "apple.com.akadns.net",
@@ -368,50 +261,265 @@ def is_apple_direct_for_sr_a(typ: str, val: str) -> bool:
     v = val.lower()
     if typ == "DOMAIN-KEYWORD":
         return v in set(APPLE_SR_DIRECT_KEYWORDS)
+    if typ == "DOMAIN-REGEX":
+        return False
     if domain_in_suffix_set(v, set(APPLE_SR_US_ONLY_SUFFIXES)):
         return False
     return domain_in_suffix_set(v, apple_roots)
 
 
-def _expand_ruleset_into(
-    emitter: RuleEmitter,
-    rulesets_dir: pathlib.Path | None,
-    name: str,
-    target: str,
-    layer: str,
-    skip_domains: set[str] | None = None,
-) -> int:
-    if not rulesets_dir:
-        return 0
-    cnt = 0
-    for typ, val in load_clash_ruleset_entries(rulesets_dir / f"{name}.yaml"):
-        if skip_domains and typ in {"DOMAIN", "DOMAIN-SUFFIX"} and val.lower() in skip_domains:
+def _prepare_dlc_bundles(dlc: DlcCatalog, apple_mode: str) -> dict[str, object]:
+    """Extract cleaned, conflict-free per-layer DLC sets with automatic exclusions."""
+    httpdns_vals = {e.value for e in dlc.get("category-httpdns-cn") if e.typ in {"domain", "full"}}
+    ad_exempt = set(LAYER3_AD_EXEMPT_DOMAINS) | httpdns_vals
+    pcdn_blocked = set(SR_PCDN_NOISE_EXACT) | set(SR_PCDN_NOISE_SUFFIXES)
+
+    # 1) Google Scheme B extensions from DLC/google@ads + @telemetry (exempt video-stats)
+    scheme_b_exempt = set(SCHEME_B_EXEMPT_DOMAINS)
+    google_parent_roots = set(GOOGLE_AI_AND_PARENT_SUFFIXES)
+    scheme_b_extra: list[tuple[str, str]] = []
+    seen_sb = set(SCHEME_B_GOOGLE_REJECT_DOMAINS)
+    for e in dlc.get("google"):
+        if "ads" not in e.attrs and "telemetry" not in e.attrs:
             continue
-        if emitter.add(typ, val, target, layer):
-            cnt += 1
-    return cnt
+        if e.typ not in {"domain", "full"} or e.value in scheme_b_exempt or e.value in seen_sb:
+            continue
+        if domain_in_suffix_set(e.value, google_parent_roots):
+            typ, val = dlc.rule_type_and_value(e)
+            scheme_b_extra.append((typ, val))
+            seen_sb.add(e.value)
+
+    # 2) Private LAN entries
+    private_entries = dlc.get("private")
+    private_domain_payload: list[str] = []
+    private_regex_entries: list[DlcEntry] = []
+    for e in private_entries:
+        if e.typ == "domain":
+            private_domain_payload.append(f"+.{e.value}")
+        elif e.typ == "full":
+            private_domain_payload.append(e.value)
+        elif e.typ == "regexp":
+            private_regex_entries.append(e)
+
+    # 3) AI lists (exclude @ads/@telemetry -> handled in L3; keep kimi.ai/moonshot.ai/minimax.io)
+    ai_openai = dlc.filter_entries(dlc.get("openai"), ban_attrs=("ads", "telemetry"))
+    ai_anthropic = dlc.filter_entries(dlc.get("anthropic"), ban_attrs=("ads", "telemetry"))
+    ai_deepmind = dlc.filter_entries(dlc.get("google-deepmind"), ban_attrs=("ads", "telemetry"))
+    ai_category = dlc.filter_entries(dlc.get("category-ai-!cn"), ban_attrs=("ads", "telemetry"))
+
+    # 4) Lightweight high-precision Layer 3 ads from category-ads-all + major vendors @ads
+    raw_ad_entries: list[DlcEntry] = list(dlc.get("category-ads-all"))
+    for vname in _DLC_AD_VENDOR_LISTS:
+        raw_ad_entries.extend(dlc.filter_entries(dlc.get(vname), must_attrs=("ads",)))
+    dlc_ad_entries: list[DlcEntry] = []
+    seen_ad_plain: set[str] = set()
+    for e in raw_ad_entries:
+        if e.plain in seen_ad_plain:
+            continue
+        seen_ad_plain.add(e.plain)
+        if e.typ in {"domain", "full"} and domain_in_suffix_set(e.value, ad_exempt):
+            continue
+        if e.typ in {"domain", "full"} and e.value in seen_sb:
+            continue
+        typ, val = dlc.rule_type_and_value(e)
+        if is_ai_protected_reject_candidate(typ, val):
+            continue
+        dlc_ad_entries.append(e)
+
+    # 5) Microsoft split sets (github -> L4; bing -> L6.1; generic microsoft -> L8 DIRECT, kept out of L7)
+    github_entries = dlc.filter_entries(dlc.get("github"), ban_attrs=("ads", "telemetry"))
+    github_vals = {e.value for e in github_entries if e.typ in {"domain", "full"}}
+    bing_entries = dlc.get("bing")
+    bing_cn_entries = dlc.filter_entries(bing_entries, must_attrs=("cn",), ban_attrs=("ads", "telemetry"))
+    bing_all_vals = {e.value for e in bing_entries if e.typ in {"domain", "full"}}
+
+    ms_proxy_reserved = (
+        set(MICROSOFT_AI_SUFFIXES)
+        | set(MS_61_PROXY_8)
+        | set(OPENAI_EXACT_DOMAINS)
+        | set(OPENAI_SUFFIXES)
+    )
+    ms_direct_entries: list[DlcEntry] = []
+    for e in dlc.filter_entries(dlc.get("microsoft"), ban_attrs=("ads", "telemetry")):
+        if e.typ in {"domain", "full"}:
+            if e.value in github_vals or e.value in bing_all_vals or e.value in ms_proxy_reserved:
+                continue
+        ms_direct_entries.append(e)
+    ms_direct_roots = {e.value for e in ms_direct_entries if e.typ in {"domain", "full"}}
+
+    # 6) Apple sets
+    apple_intel = dlc.get("apple-intelligence")
+    apple_tvplus = dlc.get("apple-tvplus")
+    apple_us_reserved = (
+        set(APPLE_SR_US_ONLY_SUFFIXES)
+        | {e.value for e in apple_intel}
+        | {e.value for e in apple_tvplus}
+    )
+    apple_all_clean = dlc.filter_entries(dlc.get("apple"), ban_attrs=("ads", "telemetry"))
+    icloud_all_clean = dlc.filter_entries(dlc.get("icloud"), ban_attrs=("ads", "telemetry"))
+
+    apple_direct_entries: list[DlcEntry] = []
+    for e in (*apple_all_clean, *icloud_all_clean):
+        if e.typ in {"domain", "full"} and e.value in apple_us_reserved:
+            continue
+        apple_direct_entries.append(e)
+    apple_direct_roots = {e.value for e in apple_direct_entries if e.typ in {"domain", "full"}}
+
+    # 7) Diagnostic IP/DNS checkers (non-@cn, non-ads)
+    checker_entries = dlc.filter_entries(
+        dlc.get("category-ip-geo-detect"),
+        ban_attrs=("cn", "ads", "telemetry"),
+    )
+
+    # 8) Overseas backbone (geolocation-!cn minus @cn, @ads, @telemetry, microsoft_direct, and apple_direct if A)
+    overseas_entries: list[DlcEntry] = []
+    gnotcn_domain_roots: set[str] = set()
+    ad_reject_roots = (
+        set(CORE_AD_SUFFIXES)
+        | set(GOOGLE_CN_AD_VARIANTS)
+        | set(LAYER3_TELEMETRY_REJECT_DOMAINS)
+    )
+    for e in dlc.filter_entries(dlc.get("geolocation-!cn"), ban_attrs=("cn", "ads", "telemetry")):
+        if e.typ == "keyword" and e.value in LAYER7_REMOVED_KEYWORDS:
+            continue
+        if e.typ in {"domain", "full"}:
+            if domain_in_suffix_set(e.value, ms_direct_roots):
+                continue
+            if domain_in_suffix_set(e.value, ad_reject_roots):
+                continue
+            if apple_mode == "a" and (
+                domain_in_suffix_set(e.value, apple_direct_roots)
+                or is_apple_direct_for_sr_a("DOMAIN" if e.typ == "full" else "DOMAIN-SUFFIX", e.value)
+            ):
+                continue
+            if e.typ == "domain":
+                gnotcn_domain_roots.add(e.value)
+        overseas_entries.append(e)
+
+    gnotcn_full_vals = {e.value for e in overseas_entries if e.typ == "full"}
+    overseas_delta = [
+        d
+        for d in OVERSEAS_PROXY_DELTA_DOMAINS
+        if d.lower() not in gnotcn_full_vals and not domain_in_suffix_set(d, gnotcn_domain_roots)
+    ]
+
+    # 9) Domestic backbone (DLC/cn clean + category-ai-cn + auto-subtracted Delta)
+    cn_ad_suffix_blocked = (
+        pcdn_blocked
+        | ad_reject_roots
+        | {e.value for e in dlc_ad_entries if e.typ == "domain"}
+    )
+    cn_ad_exact_blocked = (
+        set(LAYER3_EXACT_REJECT_DOMAINS)
+        | {e.value for e in dlc_ad_entries if e.typ == "full"}
+    )
+    cn_clean_entries: list[DlcEntry] = []
+    cn_domain_roots: set[str] = set()
+    cn_full_vals: set[str] = set()
+    cn_regex_entries: list[DlcEntry] = []
+    for e in dlc.filter_entries(dlc.get("cn"), ban_attrs=("ads", "telemetry")):
+        if e.typ in {"domain", "full"}:
+            if (
+                domain_in_suffix_set(e.value, DLC_CN_EXCLUDED_DOMAINS)
+                or e.value in cn_ad_exact_blocked
+                or domain_in_suffix_set(e.value, cn_ad_suffix_blocked)
+            ):
+                continue
+            if e.typ == "domain":
+                cn_domain_roots.add(e.value)
+            else:
+                cn_full_vals.add(e.value)
+            cn_clean_entries.append(e)
+        elif e.typ == "regexp":
+            cn_regex_entries.append(e)
+
+    # Supplement domestic AI (category-ai-cn) and Delta not yet covered by DLC/cn
+    ai_cn_entries = dlc.filter_entries(dlc.get("category-ai-cn"), ban_attrs=("ads", "telemetry"))
+    extra_cn_domains: list[tuple[str, str]] = []
+    seen_extra_cn: set[str] = set()
+
+    def _maybe_add_cn_delta(typ: str, val: str) -> None:
+        v = val.lower()
+        if (
+            domain_in_suffix_set(v, DLC_CN_EXCLUDED_DOMAINS)
+            or v in cn_ad_exact_blocked
+            or domain_in_suffix_set(v, cn_ad_suffix_blocked)
+            or v in seen_extra_cn
+        ):
+            return
+        if v in cn_full_vals or domain_in_suffix_set(v, cn_domain_roots):
+            return
+        seen_extra_cn.add(v)
+        extra_cn_domains.append((typ, v))
+
+    for e in ai_cn_entries:
+        if e.typ in {"domain", "full"}:
+            _maybe_add_cn_delta("DOMAIN-SUFFIX" if e.typ == "domain" else "DOMAIN", e.value)
+    for dom in (
+        *CN_DOMESTIC_DEV_EXTRA,
+        *CN_DOMESTIC_AI_DELTA_SUFFIXES,
+        *CN_DOMESTIC_DELTA_SUFFIXES,
+        *BYTEDANCE_CN_DELTA_SUFFIXES,
+    ):
+        _maybe_add_cn_delta("DOMAIN-SUFFIX", dom)
+
+    cn_inline_payload: list[str] = []
+    for e in cn_clean_entries:
+        cn_inline_payload.append(f"+.{e.value}" if e.typ == "domain" else e.value)
+    for typ, val in extra_cn_domains:
+        cn_inline_payload.append(f"+.{val}" if typ == "DOMAIN-SUFFIX" else val)
+
+    return {
+        "scheme_b_extra": scheme_b_extra,
+        "private_entries": private_entries,
+        "private_domain_payload": private_domain_payload,
+        "private_regex_entries": private_regex_entries,
+        "ai_openai": ai_openai,
+        "ai_anthropic": ai_anthropic,
+        "ai_deepmind": ai_deepmind,
+        "ai_category": ai_category,
+        "dlc_ad_entries": dlc_ad_entries,
+        "ad_exempt": ad_exempt,
+        "github_entries": github_entries,
+        "bing_cn_entries": bing_cn_entries,
+        "ms_direct_entries": ms_direct_entries,
+        "apple_intel": apple_intel,
+        "apple_tvplus": apple_tvplus,
+        "apple_all_clean": apple_all_clean,
+        "icloud_all_clean": icloud_all_clean,
+        "apple_direct_entries": apple_direct_entries,
+        "checker_entries": checker_entries,
+        "overseas_entries": overseas_entries,
+        "overseas_delta": overseas_delta,
+        "cn_clean_entries": cn_clean_entries,
+        "cn_regex_entries": cn_regex_entries,
+        "extra_cn_domains": extra_cn_domains,
+        "cn_inline_payload": cn_inline_payload,
+        "cn_domain_roots": cn_domain_roots,
+        "bing_cn_roots": {e.value for e in bing_cn_entries if e.typ in {"domain", "full"}},
+    }
 
 
-def _emit_common_layers_1_to_5(
+def _emit_all_layers(
     emitter: RuleEmitter,
     proxy_target: str,
     platform: str,
-    sr_reject_dom: list[tuple[str, str]],
-    sr_reject_ip: list[tuple[str, str]],
-    strict_auth0: bool = False,
-    rulesets_dir: pathlib.Path | None = None,
-    ads_filter: tuple[set[str], set[str]] | None = None,
-    lite_mode: bool = False,
-    apple_mode: str = "a",
-    available_providers: set[str] | None = None,
-    provider_behaviors: dict[str, str] | None = None,
+    dlc: DlcCatalog,
+    bundles: dict[str, object],
+    *,
+    apple_mode: str,
+    strict_auth0: bool = True,
+    drop_geoip_cn: bool = False,
+    direct_cidrs: tuple[str, ...] = (),
+    custom_user_rules: list[str] | None = None,
 ) -> dict[str, int]:
-    """Emit Layers 1 through 5 cleanly for either Shadowrocket or FlClash."""
-    counts = {"ad": 0}
-    prov = available_providers or set()
+    """Emit Layers 1 through 9 cleanly from DLC + curated Delta/Guardrails."""
+    counts = {"ad": 0, "overseas": 0, "cn_delta": len(bundles["extra_cn_domains"])}
 
     # --- Layer 1: LAN / Private ---
     emitter.comment("===== 1. 局域网 / 私有地址（最高优先级直连） =====")
+    for cidr in direct_cidrs:
+        emitter.add("IP-CIDR", cidr, "DIRECT", "L1-DirectCIDR", no_resolve=True)
     for d in LAN_EXACT_DOMAINS:
         emitter.add("DOMAIN", d, "DIRECT", "L1")
     for suf in LAN_SUFFIXES:
@@ -421,36 +529,53 @@ def _emit_common_layers_1_to_5(
     for ip6 in LAN_IPV6_CIDRS:
         emitter.add("IP-CIDR6", ip6, "DIRECT", "L1", no_resolve=True)
     if platform == "flclash":
-        if "private" in prov:
-            emitter.add_raw(_flclash_ruleset_rule("private", "DIRECT", provider_behaviors))
+        emitter.add_raw("RULE-SET,private,DIRECT")
+        for e in bundles["private_regex_entries"]:
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=False)
+            emitter.add(typ, val, "DIRECT", "L1")
     else:
-        for d in SR_LAN_INLINE_DOMAINS:
-            emitter.add("DOMAIN", d, "DIRECT", "L1")
-        for suf in SR_LAN_INLINE_SUFFIXES:
-            emitter.add("DOMAIN-SUFFIX", suf, "DIRECT", "L1")
-        _expand_ruleset_into(emitter, rulesets_dir, "private", "DIRECT", "L1")
+        for e in bundles["private_entries"]:
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=True)
+            emitter.add(typ, val, "DIRECT", "L1")
 
-    # --- Layer 1.5: QUIC Blocking + SR QQ/WeChat UDP Whitelist ---
+    # --- Layer 1.5: QUIC Blocking + QQ/WeChat UDP Whitelist ---
     emitter.blank()
     if platform == "sr":
-        emitter.comment("===== 1.5 腾讯 QQ/微信 UDP 白名单与非 QQ/微信 QUIC (UDP 443) 拦截 =====")
+        emitter.comment("===== 1.5 腾讯广告 UDP 前置拦截 + QQ/微信 UDP 白名单、非腾讯 QUIC (UDP 443) 与 PCDN (:8567) 拦截 =====")
+        for suf in SR_TENCENT_UDP_REJECT_SUFFIXES:
+            emitter.add_raw(f"AND,((PROTOCOL,UDP),(DOMAIN-SUFFIX,{suf})),REJECT-NO-DROP")
         for suf in SR_TENCENT_UDP_SUFFIXES:
             emitter.add_raw(f"AND,((PROTOCOL,UDP),(DOMAIN-SUFFIX,{suf})),DIRECT")
         emitter.add_raw("AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT-NO-DROP")
+        emitter.add_raw("AND,((PROTOCOL,UDP),(DEST-PORT,8567)),REJECT-NO-DROP")
     else:
-        emitter.comment("===== 1.5 屏蔽 QUIC（UDP 443），自动回退 TCP 防止 anytls/Trojan 套娃丢包 =====")
+        emitter.comment("===== 1.5 腾讯广告 QUIC 前置拦截 + QQ/微信 UDP 443 白名单（含裸 IP 进程兜底）、其余 QUIC 与 PCDN (:8567) 拦截 =====")
+        for suf in SR_TENCENT_UDP_REJECT_SUFFIXES:
+            emitter.add_raw(f"AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,{suf})),REJECT")
+        for suf in SR_TENCENT_UDP_SUFFIXES:
+            emitter.add_raw(f"AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,{suf})),DIRECT")
+        proc_clauses = ",".join(f"(PROCESS-NAME,{proc})" for proc in FLCLASH_TENCENT_UDP_PROCESSES)
+        emitter.add_raw(
+            f"AND,((NETWORK,UDP),(DST-PORT,443),(OR,({proc_clauses})),(GEOIP,CN,no-resolve)),DIRECT"
+        )
         emitter.add_raw("AND,((NETWORK,UDP),(DST-PORT,443)),REJECT")
+        emitter.add_raw("AND,((NETWORK,UDP),(OR,((SRC-PORT,8567),(DST-PORT,8567)))),REJECT")
 
-    # --- Layer 2: AI Platforms & Parent Immunity (with Scheme B pinpoint Google REJECT) ---
+    # --- Layer 2: AI Platforms & Group-1 Companions (with Scheme B Google REJECT) ---
     emitter.blank()
-    emitter.comment("===== 2. 主流 AI 全平台及母公司根域置顶代理（第 2 层保护，免疫第 3 层误杀） =====")
-    emitter.comment("--- 2.1 OpenAI (ChatGPT Web / App / Codex CLI / Sora) ---")
+    emitter.comment("===== 2. 主流 AI 全平台与必要鉴权/特性开关置顶代理（第 2 层保护，免疫第 3 层误杀） =====")
+    emitter.comment("--- 2.1 OpenAI (DLC/openai + ① 必要组件，剔除遥测与问卷域) ---")
+    # Pinpoint telemetry exceptions that match Layer 2.1 keywords (e.g. 'openai' in openai.qualtrics.com)
+    emitter.add("DOMAIN", "openai.qualtrics.com", "REJECT", "L2.1-TelemetryPin")
     for suf in OPENAI_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.1")
     for kw in OPENAI_KEYWORDS:
         emitter.add("DOMAIN-KEYWORD", kw, proxy_target, "L2.1")
     for dom in OPENAI_EXACT_DOMAINS:
         emitter.add("DOMAIN", dom, proxy_target, "L2.1")
+    for e in bundles["ai_openai"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, proxy_target, "L2.1")
     for suf in OPENAI_COMPANION_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.1")
     if not strict_auth0:
@@ -460,303 +585,251 @@ def _emit_common_layers_1_to_5(
         emitter.add("IP-CIDR", ip4, proxy_target, "L2.1", no_resolve=True)
     for asn in OPENAI_ASNS:
         emitter.add("IP-ASN", asn, proxy_target, "L2.1", no_resolve=True)
-    if platform == "flclash" and "openai" in prov:
-        emitter.add_raw(_flclash_ruleset_rule("openai", proxy_target, provider_behaviors))
-    elif platform == "sr":
-        skip_auth0 = set(OPENAI_BROAD_AUTH0) if strict_auth0 else None
-        _expand_ruleset_into(emitter, rulesets_dir, "openai", proxy_target, "L2.1", skip_domains=skip_auth0)
 
-    emitter.comment("--- 2.2 Anthropic (Claude Web / App / Claude Code CLI) ---")
+    emitter.comment("--- 2.2 Anthropic (DLC/anthropic，剔除遥测域) ---")
     for suf in ANTHROPIC_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.2")
     for kw in ANTHROPIC_KEYWORDS:
         emitter.add("DOMAIN-KEYWORD", kw, proxy_target, "L2.2")
     for dom in ANTHROPIC_EXACT_DOMAINS:
         emitter.add("DOMAIN", dom, proxy_target, "L2.2")
-    if platform == "flclash" and "claude" in prov:
-        emitter.add_raw(_flclash_ruleset_rule("claude", proxy_target, provider_behaviors))
-    elif platform == "sr":
-        _expand_ruleset_into(emitter, rulesets_dir, "claude", proxy_target, "L2.2")
+    for e in bundles["ai_anthropic"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, proxy_target, "L2.2")
 
-    emitter.comment("--- 2.3 Google AI 及 Google 母域（方案 B：顶部精准拦截谷歌自家广告，母域免疫三方误杀） ---")
+    emitter.comment("--- 2.3 Google AI 及 Google 母域（方案 B：顶部精确拦截谷歌自家广告，豁免 video-stats） ---")
     for g_rej in SCHEME_B_GOOGLE_REJECT_DOMAINS:
         emitter.add("DOMAIN-SUFFIX", g_rej, "REJECT", "L2.3-SchemeB")
+    for typ, val in bundles["scheme_b_extra"]:
+        emitter.add(typ, val, "REJECT", "L2.3-SchemeB-DLC")
     for suf in GOOGLE_AI_AND_PARENT_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.3")
     for kw in GOOGLE_AI_KEYWORDS:
         emitter.add("DOMAIN-KEYWORD", kw, proxy_target, "L2.3")
-    if platform == "flclash" and "gemini" in prov:
-        emitter.add_raw(_flclash_ruleset_rule("gemini", proxy_target, provider_behaviors))
-    elif platform == "sr":
-        _expand_ruleset_into(emitter, rulesets_dir, "gemini", proxy_target, "L2.3")
+    for e in bundles["ai_deepmind"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, proxy_target, "L2.3")
 
-    emitter.comment("--- 2.4 Meta AI、Meta 全系母域 & Microsoft Copilot 专属入口 ---")
+    emitter.comment("--- 2.4 Meta AI / Copilot / xAI / DLC category-ai-!cn (含 kimi.ai/moonshot.ai/minimax.io) ---")
     for suf in META_COPILOT_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.4")
     for asn in META_ASNS:
         emitter.add("IP-ASN", asn, proxy_target, "L2.4", no_resolve=True)
-
-    emitter.comment("--- 2.4.1 xAI (Grok) ---")
     for suf in XAI_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.4.1")
-
-    emitter.comment("--- 2.4.2 其他主流海外 AI 与编码工具（Perplexity / Groq / Midjourney / Cursor） ---")
     for suf in OTHER_AI_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.4.2")
+    for e in bundles["ai_category"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, proxy_target, "L2.4-DLC")
 
     emitter.comment("--- 2.5 AI 特性开关防误杀 & 流媒体短链保护 ---")
     for suf in LAYER25_PROTECTION_SUFFIXES:
         emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L2.5")
 
-    # --- Layer 3: Adblock ---
+    # --- Layer 3: Lightweight High-Precision Adblock + Group 3 Telemetry + PCDN ---
     emitter.blank()
-    if platform == "flclash":
-        emitter.comment("===== 3. 广告拦截（ads 规则集 + 差集补充 + 谷歌 -cn 变体，严格剔除 AI 保护域） =====")
-        if "ads" in prov:
-            emitter.add_raw(_flclash_ruleset_rule("ads", "REJECT", provider_behaviors))
-    elif lite_mode:
-        emitter.comment("===== 3. 广告拦截（极速轻量版：精选核心广告联盟与独有去广告补充，已剔除 AI 保护域） =====")
-    else:
-        emitter.comment("===== 3. 广告拦截（完整无冲突版：全量去广告库 + 核心广告联盟，已剔除 AI 保护域） =====")
-
-    ads_sfx, ads_exact = ads_filter if ads_filter else (set(), set())
+    emitter.comment("===== 3. 轻量高精准广告与客户端遥测拦截（DLC category-ads-all + 大厂 @ads + ③ 遥测 + 核心联盟，已排除 httpdns-cn） =====")
+    for dom in LAYER3_TELEMETRY_REJECT_DOMAINS:
+        if emitter.add("DOMAIN", dom, "REJECT", "L3-Telemetry"):
+            counts["ad"] += 1
     for suf in CORE_AD_SUFFIXES:
-        if ads_filter and platform == "flclash" and "ads" in prov and is_in_ads_set("DOMAIN-SUFFIX", suf, ads_sfx, ads_exact):
-            continue
-        if emitter.add("DOMAIN-SUFFIX", suf, "REJECT", "L3"):
+        if emitter.add("DOMAIN-SUFFIX", suf, "REJECT", "L3-Core"):
+            counts["ad"] += 1
+    for dom in LAYER3_EXACT_REJECT_DOMAINS:
+        if emitter.add("DOMAIN", dom, "REJECT", "L3-Exact"):
+            counts["ad"] += 1
+    for e in bundles["dlc_ad_entries"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        if emitter.add(typ, val, "REJECT", "L3-DLC"):
             counts["ad"] += 1
 
-    # On FlClash with 'ads' provider, deduplicate against ads.yaml (or skip 52k bulk if ads.yaml not cached).
-    # On Shadowrocket, Full includes all cleaned SR ad entries; Lite stays strictly curated via CORE_AD_SUFFIXES.
-    include_bulk_sr = (
-        (platform == "flclash" and (ads_filter is not None or "ads" not in prov))
-        or (platform == "sr" and not lite_mode)
-    )
-    if include_bulk_sr:
-        for typ, val in sr_reject_dom:
-            if is_ai_protected_reject_candidate(typ, val):
-                continue
-            dom = "cupid.iqiyi.com" if val == "api.cupid.iqiyi.com" else val
-            if ads_filter and is_in_ads_set(typ, dom, ads_sfx, ads_exact):
-                continue
-            if emitter.add(typ, dom, "REJECT", "L3"):
-                counts["ad"] += 1
-        for typ, ipval in sr_reject_ip:
-            if emitter.add(typ, ipval, "REJECT", "L3", no_resolve=True):
-                counts["ad"] += 1
+    emitter.comment("--- 3.1 P2P/STUN 刷屏降噪（精准屏蔽 B 站与多云 PCDN/STUN/Tracker，不误伤弹幕与 HTTPDNS） ---")
+    for dom in SR_PCDN_NOISE_EXACT:
+        if emitter.add("DOMAIN", dom, "REJECT", "L3-PCDN"):
+            counts["ad"] += 1
+    for suf in SR_PCDN_NOISE_SUFFIXES:
+        if emitter.add("DOMAIN-SUFFIX", suf, "REJECT", "L3-PCDN"):
+            counts["ad"] += 1
+    for kw in SR_PCDN_NOISE_KEYWORDS:
+        if emitter.add("DOMAIN-KEYWORD", kw, "REJECT", "L3-PCDN"):
+            counts["ad"] += 1
 
-    # --- Layer 4: Global Mainstream Platforms & Divergent Apple Branch ---
+    # --- Layer 4: Overseas Specials & Exceptions Above L6/L8 ---
     emitter.blank()
-    emitter.comment("===== 4. 全球主流国外平台强制代理 =====")
-    emitter.comment("--- 4.1 Twitter / X 全家桶 ---")
-    for suf in PLATFORM_41_TWITTER:
-        emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.1")
-
-    emitter.comment("--- 4.2 YouTube & Google 扩展生态 ---")
-    for suf in PLATFORM_42_YOUTUBE:
-        emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.2")
-    if platform == "flclash":
-        for rs in ("google", "youtube"):
-            if rs in prov:
-                emitter.add_raw(_flclash_ruleset_rule(rs, proxy_target, provider_behaviors))
-    else:
-        google_ad_skip_set = set(GOOGLE_CN_AD_VARIANTS) | set(CORE_AD_SUFFIXES)
-        _expand_ruleset_into(emitter, rulesets_dir, "google", proxy_target, "L4.2", skip_domains=google_ad_skip_set)
-        _expand_ruleset_into(emitter, rulesets_dir, "youtube", proxy_target, "L4.2")
-
-    emitter.comment("--- 4.3 Instagram / Threads / WhatsApp ---")
-    for suf in PLATFORM_43_META_SOCIAL:
-        emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.3")
-    if platform == "flclash":
-        for rs in ("facebook", "instagram", "whatsapp"):
-            if rs in prov:
-                emitter.add_raw(_flclash_ruleset_rule(rs, proxy_target, provider_behaviors))
-    else:
-        for rs in ("facebook", "instagram", "whatsapp"):
-            _expand_ruleset_into(emitter, rulesets_dir, rs, proxy_target, "L4.3")
-
-    emitter.comment("--- 4.4 Telegram / Discord / Line / TikTok ---")
-    for suf in PLATFORM_44_MSG:
-        emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.4")
-    if platform == "flclash":
-        for rs in ("telegram", "tiktok", "line"):
-            if rs in prov:
-                emitter.add_raw(_flclash_ruleset_rule(rs, proxy_target, provider_behaviors))
-    else:
-        for rs in ("telegram", "tiktok", "line"):
-            _expand_ruleset_into(emitter, rulesets_dir, rs, proxy_target, "L4.4")
-
-    emitter.comment("--- 4.5 GitHub / HuggingFace / Docker / 开发者与知识社区 ---")
-    for suf in PLATFORM_45_DEV_COMMUNITY:
-        emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.5")
-    if platform == "flclash" and "github" in prov:
-        emitter.add_raw(_flclash_ruleset_rule("github", proxy_target, provider_behaviors))
-    elif platform == "sr":
-        _expand_ruleset_into(emitter, rulesets_dir, "github", proxy_target, "L4.5")
-
-    emitter.comment("--- 4.6 海外流媒体与测速 ---")
-    for suf in PLATFORM_46_STREAMING:
-        emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.6")
-    if platform == "flclash" and "speedtest" in prov:
-        emitter.add_raw(_flclash_ruleset_rule("speedtest", proxy_target, provider_behaviors))
-    elif platform == "sr":
-        _expand_ruleset_into(emitter, rulesets_dir, "speedtest", proxy_target, "L4.6")
+    emitter.comment("===== 4. 海外专题例外代理（GitHub 防微软截胡 + Apple 分支 + 缺失日志域补全） =====")
+    for dom in PLATFORM_44_LOG_VERIFIED_DELTAS:
+        emitter.add("DOMAIN-SUFFIX", dom, proxy_target, "L4-Delta")
+    for e in bundles["github_entries"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, proxy_target, "L4-GitHub")
+    for e in bundles["apple_intel"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, proxy_target, "L4-AppleIntel")
+    for suf in APPLE_SAFEBROWSING_OHTTP_SUFFIXES:
+        emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4-AppleOHTTP")
 
     if apple_mode == "a":
-        emitter.comment("--- 4.7 美区 Apple 专属服务代理（Situation A：Apple Intelligence / News / TV+） ---")
+        emitter.comment("--- 4.7 美区 Apple 专属代理（Situation A：Apple Intelligence / TV+ / News / Siri） ---")
+        for e in bundles["apple_tvplus"]:
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+            emitter.add(typ, val, proxy_target, "L4.7-TVPlus")
         for suf in APPLE_SR_US_ONLY_SUFFIXES:
-            emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.7")
+            emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.7-USOnly")
     else:
-        emitter.comment("--- 4.7 Apple 全生态代理（Situation B：Win/Android 或外区常驻） ---")
+        emitter.comment("--- 4.7 Apple 全生态代理（Situation B：Win/Android） ---")
         for suf in APPLE_COMMON_SUFFIXES:
             emitter.add("DOMAIN-SUFFIX", suf, proxy_target, "L4.7")
-        if platform == "flclash" and "apple" in prov:
-            emitter.add_raw(_flclash_ruleset_rule("apple", proxy_target, provider_behaviors))
-        elif platform == "sr":
-            _expand_ruleset_into(emitter, rulesets_dir, "apple", proxy_target, "L4.7")
+        for e in (*bundles["apple_all_clean"], *bundles["icloud_all_clean"]):
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+            emitter.add(typ, val, proxy_target, "L4.7-DLC")
 
-    # --- Layer 5: 36 Diagnostic Checkers ---
+    # --- Layer 5: Diagnostic Checkers ---
     emitter.blank()
-    emitter.comment(f"===== 5. IP 与 DNS 检测站（{len(CHECKER_DOMAINS_36)} 条，强制走代理） =====")
-    for dom in CHECKER_DOMAINS_36:
-        emitter.add("DOMAIN-SUFFIX", dom, proxy_target, "L5")
+    emitter.comment("===== 5. IP / DNS / WebRTC 检测站（1ms.dog + DLC category-ip-geo-detect@-cn，强制走代理） =====")
+    for dom in CHECKER_DELTA_DOMAINS:
+        emitter.add("DOMAIN-SUFFIX", dom, proxy_target, "L5-Delta")
+    for e in bundles["checker_entries"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, proxy_target, "L5-DLC")
 
-    return counts
-
-
-def _emit_common_layers_6_to_9(
-    emitter: RuleEmitter,
-    proxy_target: str,
-    platform: str,
-    sr_direct: list[tuple[str, str]],
-    sr_proxy: list[tuple[str, str]],
-    apple_mode: str = "a",
-    zoom_mode: str = "direct",
-    rulesets_dir: pathlib.Path | None = None,
-    available_providers: set[str] | None = None,
-    provider_behaviors: dict[str, str] | None = None,
-    bytedance_provider: str | None = None,
-    drop_geoip_cn: bool = False,
-    custom_preserved_rules: list[str] | None = None,
-) -> dict[str, int]:
-    """Emit Layers 6 through 9 cleanly with platform-divergent Apple/CN handling."""
-    prov = available_providers or set()
-    counts = {"direct": 0, "proxy": 0}
-
-    # --- Layer 6: Apple Situation A Direct + Microsoft 6.1 + Top500 Whitelist ---
+    # --- Layer 6: Minimal Direct Exceptions & Microsoft Split ---
     emitter.blank()
     if apple_mode == "a":
-        emitter.comment("===== 6. Apple 下载/iCloud 直连 + 微软特例 + Top500 可直连白名单 =====")
-        emitter.comment("--- 6.0 App Store / iCloud 与 Apple 通用服务直连（Situation A） ---")
+        emitter.comment("===== 6. Apple 美区 App Store/iCloud 直连（Situation A）+ 微软/Amazon.cn 边界 =====")
         for suf in (*APPLE_COMMON_SUFFIXES, *APPLE_SR_DIRECT_EXTRA_SUFFIXES):
             emitter.add("DOMAIN-SUFFIX", suf, "DIRECT", "L6.0")
+        for e in bundles["apple_direct_entries"]:
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+            emitter.add(typ, val, "DIRECT", "L6.0-DLC")
         for kw in APPLE_SR_DIRECT_KEYWORDS:
             emitter.add("DOMAIN-KEYWORD", kw, "DIRECT", "L6.0")
         for ip4 in APPLE_CIDRS_V4:
             emitter.add("IP-CIDR", ip4, "DIRECT", "L6.0", no_resolve=True)
         for ip6 in APPLE_CIDRS_V6:
             emitter.add("IP-CIDR6", ip6, "DIRECT", "L6.0", no_resolve=True)
-        if platform == "sr":
-            _expand_ruleset_into(emitter, rulesets_dir, "apple", "DIRECT", "L6.0")
-        elif "apple" in prov:
-            emitter.add_raw(_flclash_ruleset_rule("apple", "DIRECT", provider_behaviors))
     else:
-        emitter.comment("===== 6. 微软特例 + Top500 可直连网站白名单 =====")
+        emitter.comment("===== 6. 微软特例与 Amazon.cn 边界（已清除 Top500 海外白名单，zoom.us 随 L7 走代理） =====")
 
-    emitter.comment("--- 6.1 微软特定分流（须排在第 8 层 microsoft 之前） ---")
+    emitter.comment("--- 6.1 微软特定分流 + Windows NCSI + amazon.cn（须排在 L7/L8 之前） ---")
+    for dom in AMAZON_CN_DIRECT:
+        emitter.add("DOMAIN-SUFFIX", dom, "DIRECT", "L6.1")
     for dom in MS_61_DIRECT:
         emitter.add("DOMAIN-SUFFIX", dom, "DIRECT", "L6.1")
+    for e in bundles["bing_cn_entries"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, "DIRECT", "L6.1-BingCN")
     for dom in MS_61_PROXY_8:
         emitter.add("DOMAIN-SUFFIX", dom, proxy_target, "L6.1")
+    for dom in FLCLASH_NCSI_IPV6_REJECT:
+        emitter.add("DOMAIN", dom, "REJECT", "L6.1-NCSI")
+    for suf in FLCLASH_NCSI_DIRECT_SUFFIXES:
+        emitter.add("DOMAIN-SUFFIX", suf, "DIRECT", "L6.1-NCSI")
+    # Pin Microsoft-specific Akamai/Akadns CDN hostnames from DLC/microsoft above L7 akamaized.net/akadns.net
+    for e in bundles["ms_direct_entries"]:
+        if e.typ in {"domain", "full"} and e.value.endswith(
+            (".akamaized.net", ".akadns.net", ".edgekey.net", ".edgesuite.net")
+        ):
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+            emitter.add(typ, val, "DIRECT", "L6.1-MS-CDN")
 
-    emitter.comment("--- 6.2 Top500 可直连网站白名单（已剔除 cloudflare.com，保留 amazon.cn） ---")
-    if emitter.add("DOMAIN-SUFFIX", "amazon.cn", "DIRECT", "L6.2"):
-        counts["direct"] += 1
-    zoom_target = "DIRECT" if zoom_mode == "direct" else proxy_target
-    emitter.add("DOMAIN-SUFFIX", "zoom.us", zoom_target, "L6.2")
-
-    for typ, val in sr_direct:
-        if val in SR_DIRECT_SKIP_EXACT:
-            continue
-        if typ in {"IP-CIDR", "IP-CIDR6"}:
-            continue
-        if emitter.add(typ, val, "DIRECT", "L6.2"):
-            counts["direct"] += 1
-
-    # --- Layer 7: Remaining Overseas Proxy Rules + Preserved Custom Airport Group Routes ---
+    # --- Layer 7: Overseas Backbone (DLC/geolocation-!cn cleaned + Overseas Delta) ---
     emitter.blank()
-    emitter.comment("===== 7. 其余海外网站代理列表（含 cloudflare.com 代理保障，已剔除冲突项） =====")
+    emitter.comment("===== 7. 海外网站主干（清洗版 DLC geolocation-!cn + 海外 Delta，已剔除 @cn/广告/微软更新域） =====")
     emitter.add("DOMAIN-SUFFIX", "cloudflare.com", proxy_target, "L7")
-    cn_ad_set = set(GOOGLE_CN_AD_VARIANTS) | set(CORE_AD_SUFFIXES)
+    for dom in bundles["overseas_delta"]:
+        if emitter.add("DOMAIN-SUFFIX", dom, proxy_target, "L7-Delta"):
+            counts["overseas"] += 1
+    for e in bundles["overseas_entries"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        if emitter.add(typ, val, proxy_target, "L7-DLC"):
+            counts["overseas"] += 1
 
-    if custom_preserved_rules:
-        emitter.comment("--- 原生机场订阅保留的非主策略组自定义分流 ---")
-        for raw_custom in custom_preserved_rules:
-            emitter.add_raw(raw_custom)
+    if custom_user_rules:
+        emitter.blank()
+        emitter.comment("--- Preserved custom user rules ---")
+        allowed_sr_actions = frozenset({"PROXY", "DIRECT", "REJECT", "REJECT-DROP", "REJECT-NO-DROP", "REJECT-TINYGIF"})
+        ms_protected_roots = set(MICROSOFT_COMMON_SUFFIXES) | {
+            e.value for e in bundles["ms_direct_entries"] if e.typ == "domain"
+        }
+        ms_protected_exact = {
+            e.value for e in bundles["ms_direct_entries"] if e.typ == "full"
+        }
+        ad_exempt_set: set[str] = set(bundles["ad_exempt"])
+        cn_protected_roots = set(bundles["cn_domain_roots"])
+        for cr in custom_user_rules:
+            parts = [p.strip() for p in cr.split(",")]
+            if len(parts) < 3:
+                continue
+            typ = parts[0].upper()
+            if typ not in {"DOMAIN", "DOMAIN-SUFFIX", "IP-CIDR", "IP-CIDR6"}:
+                continue
+            has_nr = parts[-1].lower() == "no-resolve"
+            if has_nr and len(parts) < 4:
+                continue
+            val = parts[1]
+            val_low = val.lower()
+            act = parts[-2] if has_nr else parts[-1]
+            act_up = act.upper()
+            if act_up not in allowed_sr_actions:
+                emitter.notes.append(
+                    f"[UserConf] skipped unsupported/airport policy action '{typ},{val},{act}' "
+                    "(only built-in PROXY/DIRECT/REJECT* actions are allowed in --user-conf)"
+                )
+                continue
+            if act_up.startswith("REJECT"):
+                if is_ai_protected_reject_candidate(typ, val) or val_low in ad_exempt_set or domain_in_suffix_set(val_low, ad_exempt_set):
+                    emitter.notes.append(
+                        f"[UserConf] skipped protected/exempt REJECT rule '{typ},{val},{act}'"
+                    )
+                    continue
+            if act_up != "DIRECT" and typ in {"DOMAIN", "DOMAIN-SUFFIX"}:
+                if (
+                    val_low in ms_protected_exact
+                    or domain_in_suffix_set(val_low, ms_protected_roots)
+                    or domain_in_suffix_set(val_low, cn_protected_roots)
+                ):
+                    emitter.notes.append(
+                        f"[UserConf] skipped L8 domestic/Microsoft override '{typ},{val},{act}' "
+                        "(do not pass raw airport .conf files to --user-conf)"
+                    )
+                    continue
+            emitter.add(typ, val, act_up, "UserConf", no_resolve=(has_nr or typ in {"IP-CIDR", "IP-CIDR6"}))
 
-    for typ, val in sr_proxy:
-        if typ == "DOMAIN-KEYWORD" and val in LAYER7_REMOVED_KEYWORDS:
-            continue
-        if typ in {"DOMAIN", "DOMAIN-SUFFIX"} and domain_in_suffix_set(val, cn_ad_set):
-            continue
-        if apple_mode == "a" and is_apple_direct_for_sr_a(typ, val):
-            continue
-        if emitter.add(typ, val, proxy_target, "L7"):
-            counts["proxy"] += 1
-
-    # --- Layer 8: Domestic Routing ---
+    # --- Layer 8: Domestic Backbone + Clean Microsoft Direct + CN IP ---
     emitter.blank()
-    emitter.comment("===== 8. 国内分流（微软通用 / 字节系 / 国产 AI / 高频直连 / .cn / 国内 IP） =====")
-    emitter.comment("--- 8.0 基础大厂直连与国内规则集 ---")
-    if platform == "flclash":
-        emitter.add("DOMAIN-SUFFIX", "cn", "DIRECT", "L8.0")
-        if "microsoft" in prov:
-            emitter.add_raw(_flclash_ruleset_rule("microsoft", "DIRECT", provider_behaviors))
-        else:
-            for suf in MICROSOFT_COMMON_SUFFIXES:
-                emitter.add("DOMAIN-SUFFIX", suf, "DIRECT", "L8.0")
-        if bytedance_provider and bytedance_provider in prov:
-            emitter.add_raw(_flclash_ruleset_rule(bytedance_provider, "DIRECT", provider_behaviors))
-        else:
-            for suf in BYTEDANCE_COMMON_SUFFIXES:
-                emitter.add("DOMAIN-SUFFIX", suf, "DIRECT", "L8.0")
-        # Note: volces.com / volcengine.com bare roots have no public A record; traffic uses subdomains like ark.cn-beijing.volces.com
-        for dom in (*CN_DOMESTIC_DEV_EXTRA, *CN_DOMESTIC_AI_SUFFIXES):
-            emitter.add("DOMAIN-SUFFIX", dom, "DIRECT", "L8.0")
-        if "cn-domain" in prov:
-            emitter.add_raw(_flclash_ruleset_rule("cn-domain", "DIRECT", provider_behaviors))
-    else:
-        if rulesets_dir and (rulesets_dir / "microsoft.yaml").is_file():
-            _expand_ruleset_into(emitter, rulesets_dir, "microsoft", "DIRECT", "L8.0")
-        else:
-            for suf in MICROSOFT_COMMON_SUFFIXES:
-                emitter.add("DOMAIN-SUFFIX", suf, "DIRECT", "L8.0")
-        for suf in BYTEDANCE_COMMON_SUFFIXES:
-            emitter.add("DOMAIN-SUFFIX", suf, "DIRECT", "L8.0")
+    emitter.comment("===== 8. 国内总集与微软直连（DLC/microsoft + DLC/cn + 自动差集 Delta） =====")
+    for e in bundles["ms_direct_entries"]:
+        typ, val = dlc.rule_type_and_value(e, csv_safe_regex=(platform == "sr"))
+        emitter.add(typ, val, "DIRECT", "L8.0-MS")
 
-        emitter.comment("--- 8.1 Shadowrocket 国内主流 .com/.net、国产 AI 与 CDN 直连补全 ---")
-        for dom in (*SR_CN_NON_CN_235, *CN_DOMESTIC_AI_SUFFIXES):
-            emitter.add("DOMAIN-SUFFIX", dom, "DIRECT", "L8.1")
-        emitter.add("DOMAIN-SUFFIX", "cn", "DIRECT", "L8.1")
+    if platform == "flclash":
+        emitter.add_raw("RULE-SET,cn-domain,DIRECT")
+        for e in bundles["cn_regex_entries"]:
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=False)
+            emitter.add(typ, val, "DIRECT", "L8.1-Regex")
+    else:
+        for typ, val in bundles["extra_cn_domains"]:
+            emitter.add(typ, val, "DIRECT", "L8.1-Delta")
+        for e in bundles["cn_clean_entries"]:
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=True)
+            emitter.add(typ, val, "DIRECT", "L8.1-DLC")
+        for e in bundles["cn_regex_entries"]:
+            typ, val = dlc.rule_type_and_value(e, csv_safe_regex=True)
+            emitter.add(typ, val, "DIRECT", "L8.1-Regex")
 
     emitter.comment("--- 8.2 国内 IP 兜底与防泄露（全带 ,no-resolve） ---")
-    if platform == "flclash":
-        if "cn-ip" in prov:
-            emitter.add_raw("RULE-SET,cn-ip,DIRECT,no-resolve")
-        if not (drop_geoip_cn and "cn-ip" in prov):
-            emitter.add_raw("GEOIP,CN,DIRECT,no-resolve")
-    else:
+    if not drop_geoip_cn:
         emitter.add_raw("GEOIP,CN,DIRECT,no-resolve")
 
-    # --- Layer 9: Final Fallback ---
+    # --- Layer 9: Final Terminator ---
     emitter.blank()
-    emitter.comment("===== 9. 终极兜底规则（其余未知海外网站一律走代理） =====")
+    emitter.comment("===== 9. 终极兜底规则（其余未知海外流量一律走代理） =====")
     emitter.add_raw(f"FINAL,{proxy_target}" if platform == "sr" else f"MATCH,{proxy_target}")
     return counts
 
 
 def _extract_sr_custom_user_rules(user_conf: pathlib.Path | None) -> list[str]:
-    """Read non-empty custom rules from an existing Shadowrocket conf if supplied."""
     if not user_conf or not user_conf.is_file():
         return []
     in_rule = False
@@ -769,9 +842,10 @@ def _extract_sr_custom_user_rules(user_conf: pathlib.Path | None) -> list[str]:
         if s.startswith("[") and s.endswith("]"):
             in_rule = False
             continue
-        if not in_rule or not s or s.startswith(("#", ";")):
+        if not in_rule or not s or s.startswith(("#", ";", "//")):
             continue
-        if s.upper().startswith(("FINAL,", "GEOIP,CN", "AND,((PROTOCOL,UDP)")):
+        s = re.sub(r"\s+(?://|#).*$", "", s).strip()
+        if not s or s.upper().startswith(("FINAL,", "GEOIP,CN", "AND,((PROTOCOL,UDP)")):
             continue
         out.append(s)
     return out
@@ -779,77 +853,36 @@ def _extract_sr_custom_user_rules(user_conf: pathlib.Path | None) -> list[str]:
 
 def build_shadowrocket(
     out_path: pathlib.Path,
-    sr_source: pathlib.Path,
-    profile: str = "lite",
+    dlc_source: pathlib.Path,
     apple_mode: str = "a",
-    zoom_mode: str = "direct",
-    strict_auth0: bool = False,
-    rulesets_dir: pathlib.Path | None = None,
-    ads_ruleset: pathlib.Path | None = None,
+    strict_auth0: bool = True,
     user_conf: pathlib.Path | None = None,
+    direct_cidrs: tuple[str, ...] = (),
     name: str = "Hardened-iOS-Shadowrocket",
     desc: str = "",
 ) -> int:
-    """Build a hardened, pure-LF Shadowrocket .conf file and verify it with audit_subscription."""
-    sr_reject_dom, sr_reject_ip, sr_direct, sr_proxy = parse_sr_upstream(sr_source)
-    if ads_ruleset is not None:
-        print("[INFO]  --ads-ruleset is only used in --mode flclash; ignored for Shadowrocket")
-    # Shadowrocket has no RULE-SET,ads in generated configs; never strip SR ad entries against ads.yaml.
-    ads_filter = None
+    """Build a pure-DLC, zero-airport-dependency Shadowrocket .conf (Full profile, pure LF)."""
+    dlc = DlcCatalog.from_source(dlc_source)
+    bundles = _prepare_dlc_bundles(dlc, apple_mode=apple_mode)
 
     emitter = RuleEmitter("sr")
     custom_rules = _extract_sr_custom_user_rules(user_conf)
     if custom_rules:
-        print(f"[INFO]  Parsed {len(custom_rules)} existing rule(s) from --user-conf; merging deduplicated non-conflicting rules into Layer 7")
+        print(f"[INFO]  Parsed {len(custom_rules)} rule(s) from --user-conf; merging non-conflicting rules above Layer 8")
 
-    c15 = _emit_common_layers_1_to_5(
+    c = _emit_all_layers(
         emitter,
         proxy_target="PROXY",
         platform="sr",
-        sr_reject_dom=sr_reject_dom,
-        sr_reject_ip=sr_reject_ip,
+        dlc=dlc,
+        bundles=bundles,
+        apple_mode=apple_mode,
         strict_auth0=strict_auth0,
-        rulesets_dir=rulesets_dir,
-        ads_filter=ads_filter,
-        lite_mode=(profile == "lite"),
-        apple_mode=apple_mode,
-    )
-    c69 = _emit_common_layers_6_to_9(
-        emitter,
-        proxy_target="PROXY",
-        platform="sr",
-        sr_direct=sr_direct,
-        sr_proxy=sr_proxy,
-        apple_mode=apple_mode,
-        zoom_mode=zoom_mode,
-        rulesets_dir=rulesets_dir,
-        custom_preserved_rules=None,
+        direct_cidrs=direct_cidrs,
+        custom_user_rules=custom_rules,
     )
 
-    if custom_rules:
-        # Insert clean user custom domain/IP rules right above Layer 8 without breaking Layer 8/9
-        insert_idx = next(
-            (i for i, ln in enumerate(emitter.lines) if ln.startswith("# ===== 8.")),
-            len(emitter.lines),
-        )
-        custom_added: list[str] = ["# --- Preserved custom user rules ---"]
-        for cr in custom_rules:
-            parts = [p.strip() for p in cr.split(",")]
-            if len(parts) >= 3 and parts[0].upper() in {"DOMAIN", "DOMAIN-SUFFIX", "IP-CIDR", "IP-CIDR6"}:
-                typ = parts[0].upper()
-                val = parts[1]
-                act = parts[2] if parts[-1].lower() != "no-resolve" else parts[-2]
-                if (typ, val.lower()) not in emitter.seen_exact:
-                    if typ in {"IP-CIDR", "IP-CIDR6"}:
-                        typ = "IP-CIDR6" if ":" in val else "IP-CIDR"
-                        custom_added.append(f"{typ},{val},{act},no-resolve")
-                    else:
-                        custom_added.append(f"{typ},{val},{act}")
-        if len(custom_added) > 1:
-            emitter.lines[insert_idx:insert_idx] = custom_added + [""]
-
-    profile_label = "极速轻量版" if profile == "lite" else "完整无冲突版"
-    header_desc = desc or f"AI置顶防误杀(方案B) + {profile_label}去广告 + QQ/微信UDP直连 + Apple情况{apple_mode.upper()}"
+    header_desc = desc or f"DLC主干 + 轻量高精准去广告 + 遥测拦截 + Apple情况{apple_mode.upper()}"
     header = [
         f"#!name={name}",
         f"#!desc={header_desc}",
@@ -873,115 +906,577 @@ def build_shadowrocket(
     out_path.write_bytes(content.encode("utf-8"))
 
     print(
-        f"[BUILD] Shadowrocket ({profile}, Apple={apple_mode.upper()}) -> {out_path} "
-        f"(ads={c15['ad']}, top500_direct={c69['direct']}, sr_proxy={c69['proxy']}, rules={emitter.rule_count})"
+        f"[BUILD] Shadowrocket (DLC Full, Apple={apple_mode.upper()}) -> {out_path} "
+        f"(ads={c['ad']}, overseas={c['overseas']}, cn_delta={c['cn_delta']}, rules={emitter.rule_count})"
     )
     for note in emitter.notes[:20]:
         print(f"[NOTE]  {note}")
     if len(emitter.notes) > 20:
         print(f"[NOTE]  ... and {len(emitter.notes) - 20} additional dedup/shadow notes")
 
-    report = audit_shadowrocket(out_path, strict=True, profile=profile, apple_mode=apple_mode)
+    report = audit_shadowrocket(out_path, strict=True, profile="full", apple_mode=apple_mode)
     print(format_report(report))
-    return 1 if report.errors else 0
+    return 1 if (report.errors or report.warnings) else 0
+
+
+def _is_action_container(proxies: list[str] | None) -> bool:
+    if not proxies:
+        return False
+    return all(p.upper() in BUILTIN_MIHOMO_ACTIONS for p in proxies)
+
+
+_PRIMARY_GROUP_POSITIVE_HINTS = (
+    "节点选择",
+    "手动切换",
+    "手动选择",
+    "总代理",
+    "代理选择",
+    "proxy",
+    "select",
+    "main",
+    "global",
+)
+_PRIMARY_GROUP_NEGATIVE_HINTS = (
+    "直连",
+    "国内",
+    "广告",
+    "拦截",
+    "屏蔽",
+    "净化",
+    "漏网",
+    "苹果",
+    "apple",
+    "微软",
+    "microsoft",
+    "netflix",
+    "disney",
+    "spotify",
+    "youtube",
+    "tiktok",
+    "bilibili",
+    "telegram",
+    "openai",
+    "chatgpt",
+    "claude",
+    "ai服务",
+    "emby",
+    "steam",
+    "游戏",
+    "game",
+    "流媒体",
+    "media",
+    "direct",
+    "reject",
+)
 
 
 def _detect_primary_select_group(group_lines: list[tuple[int, str]]) -> str | None:
-    """Detect the first `type: select` group name in FlClash/Mihomo proxy-groups."""
-    cur_name: str | None = None
-    for _, raw in group_lines[1:]:
-        clean = _strip_inline_comment(raw).strip()
-        if not clean:
-            continue
-        m_name = re.match(r"^(?:-\s+)?name\s*:\s*(.+)$", clean)
-        if m_name:
-            cur_name = _strip_yaml_quotes(m_name.group(1).strip())
-            continue
-        m_type = re.match(r"^type\s*:\s*(.+)$", clean)
-        if m_type and cur_name:
-            if _strip_yaml_quotes(m_type.group(1).strip()).lower() == "select":
-                return cur_name
-            cur_name = None
+    entries = _parse_proxy_group_entries(group_lines)
+    select_candidates = [e for e in entries if e["type"] == "select" and not _is_action_container(e["proxies"])]
+    if select_candidates:
+        def _score(idx_entry: tuple[int, dict]) -> tuple[int, int]:
+            idx, e = idx_entry
+            name_low = (e["name"] or "").lower()
+            score = 0
+            if any(h in name_low for h in _PRIMARY_GROUP_POSITIVE_HINTS):
+                score += 40
+            if any(h in name_low for h in _PRIMARY_GROUP_NEGATIVE_HINTS):
+                score -= 50
+            pxs = e.get("proxies") or []
+            if pxs:
+                first_up = pxs[0].upper()
+                if first_up in {"DIRECT", "REJECT", "REJECT-DROP"}:
+                    score -= 60
+                else:
+                    score += 10
+            if e.get("has_use") or e.get("has_include_all"):
+                score += 10
+            return (-score, idx)
+
+        ranked = sorted(enumerate(select_candidates), key=_score)
+        chosen = ranked[0][1]["name"]
+        if len(select_candidates) > 1:
+            print(
+                f"[INFO]  Auto-selected primary proxy-group '{chosen}' from {len(select_candidates)} select groups "
+                "(pass --proxy-group to override)"
+            )
+        return chosen
+    for entry in entries:
+        if entry["type"] == "select":
+            return entry["name"]
     names = sorted(_extract_proxy_group_names(group_lines))
     return names[0] if names else None
 
 
-def _parse_provider_blocks(prov_lines: list[tuple[int, str]]) -> tuple[set[str], str | None, dict[str, str]]:
-    """Return (provider_names, detected_bytedance_provider, effective_provider_behaviors)."""
-    names: set[str] = set()
-    behaviors: dict[str, str] = {}
-    bytedance: str | None = None
-    cur_name = ""
-    base_indent = -1
-    for _, raw in prov_lines[1:]:
-        clean = _strip_inline_comment(raw)
-        if not clean.strip():
+def _dedup_proxy_members(
+    decoded_list: list[str],
+    raw_list: list[str],
+    replacements: dict[str, tuple[str, str]],
+) -> tuple[list[str], list[str], bool]:
+    new_dec: list[str] = []
+    new_raw: list[str] = []
+    seen: set[str] = set()
+    changed = False
+    for dec, raw in zip(decoded_list, raw_list):
+        cur_dec, cur_raw = dec, raw
+        for _ in range(16):
+            nxt = replacements.get(cur_dec)
+            if not nxt or nxt[0] == cur_dec:
+                break
+            cur_dec, cur_raw = nxt
+            changed = True
+        if cur_dec in seen:
+            changed = True
             continue
-        indent = len(clean) - len(clean.lstrip())
-        s = clean.strip()
-        if s.endswith(":") and (base_indent == -1 or indent <= base_indent):
-            base_indent = indent
-            cur_name = s[:-1].strip()
-            names.add(cur_name)
-            if cur_name in PROVIDER_EXPECTED_BEHAVIOR:
-                behaviors[cur_name] = PROVIDER_EXPECTED_BEHAVIOR[cur_name]
-            if "bytedance" in cur_name.lower():
-                bytedance = cur_name
-        elif cur_name:
-            if s.startswith("behavior:") and cur_name not in PROVIDER_EXPECTED_BEHAVIOR:
-                behaviors[cur_name] = s.split(":", 1)[1].strip().strip("\"'").lower()
-            if "bytedance" in s.lower() or "douyin" in s.lower():
-                bytedance = cur_name
-    return names, bytedance, behaviors
+        seen.add(cur_dec)
+        new_dec.append(cur_dec)
+        new_raw.append(cur_raw)
+    return new_dec, new_raw, changed
 
 
-def _rewrite_rule_providers_behavior(prov_lines: list[tuple[int, str]]) -> list[str]:
-    """Fix mismatched provider behavior fields while preserving all custom airport providers."""
-    if not prov_lines:
-        return []
-    out: list[str] = []
-    cur_name = ""
-    base_indent = -1
-    for _, raw in prov_lines:
-        clean = _strip_inline_comment(raw)
-        s = clean.strip()
-        if s and not raw.lstrip().startswith("#") and raw[0].isspace():
-            indent = len(clean) - len(clean.lstrip())
-            if s.endswith(":") and (base_indent == -1 or indent <= base_indent):
-                base_indent = indent
-                cur_name = s[:-1].strip()
-            elif cur_name in PROVIDER_EXPECTED_BEHAVIOR and s.startswith("behavior:"):
-                expected = PROVIDER_EXPECTED_BEHAVIOR[cur_name]
-                leading = raw[: len(raw) - len(raw.lstrip())]
-                out.append(f"{leading}behavior: {expected}")
+def _render_hardened_group_lines(
+    entry: dict,
+    min_interval: int,
+    proxies_changed: bool,
+) -> list[str]:
+    force_select = bool(entry.get("force_select"))
+    is_auto = (entry["type"] in AUTO_TEST_GROUP_TYPES) and not force_select
+
+    def _upgrade_line(text: str) -> str:
+        code, comment = _split_inline_comment(text)
+        code = re.sub(
+            r"""((?:^|\s|[,{])url\s*:\s*['"]?)http://([^\s'"#},]+)""",
+            r"\1https://\2",
+            code,
+        )
+        code = re.sub(
+            r"((?:^|\s|[,{])interval\s*:\s*)(\d+)",
+            lambda m: f"{m.group(1)}{max(int(m.group(2)), min_interval)}",
+            code,
+        )
+        return f"{code}{comment}"
+
+    if entry["is_flow"]:
+        line = _upgrade_line(entry["lines"][0])
+        if force_select:
+            code, comment = _split_inline_comment(line)
+            code = re.sub(
+                r"""((?:^|\s|[,{])type\s*:\s*)(?:"[^"]*"|'[^']*'|[^,}\s]+)""",
+                r"\1select",
+                code,
+                count=1,
+                flags=re.I,
+            )
+            line = f"{code}{comment}"
+        if proxies_changed and entry["proxy_raws"] is not None:
+            joined = ", ".join(entry["proxy_raws"])
+            line = _replace_flow_bracket_list(line, "proxies", f"[{joined}]")
+        if is_auto:
+            code, comment = _split_inline_comment(line)
+            if re.search(r"(?:^|\s|[,{])lazy\s*:", code):
+                code = re.sub(r"((?:^|\s|[,{])lazy\s*:\s*)(?:true|false)", r"\1true", code, flags=re.I)
+            else:
+                idx = code.rfind("}")
+                if idx != -1:
+                    before = code[:idx].rstrip()
+                    sep = "" if before.endswith("{") else ", "
+                    code = f"{before}{sep}lazy: true{code[idx:]}"
+            line = f"{code}{comment}"
+        return [line]
+
+    raw_lines = list(entry["lines"])
+    trailing_blanks: list[str] = []
+    while raw_lines and not raw_lines[-1].strip():
+        trailing_blanks.insert(0, raw_lines.pop())
+
+    first_clean = _strip_inline_comment(raw_lines[0])
+    head_indent = len(first_clean) - len(first_clean.lstrip())
+    key_indent = head_indent + 2
+    for rl in raw_lines[1:]:
+        cl = _strip_inline_comment(rl)
+        st = cl.strip()
+        if st and not st.startswith("-") and ":" in st:
+            key_indent = len(cl) - len(cl.lstrip())
+            break
+
+    rendered: list[str] = []
+    seen_lazy = False
+    lazy_insert_idx = -1
+    skipping_proxies_items = False
+    skipping_multiline_flow = False
+    proxies_indent: int | None = None
+
+    for line_idx, rl in enumerate(raw_lines):
+        cl = _strip_inline_comment(rl)
+        st = cl.strip()
+        ind = len(cl) - len(cl.lstrip()) if st else 0
+
+        if skipping_multiline_flow:
+            if "]" in cl:
+                skipping_multiline_flow = False
+            continue
+
+        if skipping_proxies_items:
+            if not st or st.startswith("#"):
                 continue
-        out.append(raw)
+            if proxies_indent is not None and ind >= proxies_indent and st.startswith("-"):
+                continue
+            skipping_proxies_items = False
+            proxies_indent = None
+
+        if proxies_changed and entry["proxy_raws"] is not None:
+            m_px = re.match(r"^(\s*(?:-\s+)?)proxies\s*:\s*(.*)$", cl)
+            if m_px:
+                tail = m_px.group(2).strip()
+                item_ind = key_indent + 2
+                for nxt in raw_lines[line_idx + 1 :]:
+                    ncl = _strip_inline_comment(nxt)
+                    nst = ncl.strip()
+                    if nst.startswith("-"):
+                        item_ind = len(ncl) - len(ncl.lstrip())
+                        break
+                if tail.startswith("["):
+                    joined = ", ".join(entry["proxy_raws"])
+                    if "]" in tail:
+                        rendered.append(_replace_flow_bracket_list(rl, None, f"[{joined}]"))
+                    else:
+                        code, comment = _split_inline_comment(rl)
+                        bpos = code.find("[")
+                        rendered.append(f"{code[:bpos]}[{joined}]{comment}")
+                        skipping_multiline_flow = True
+                else:
+                    rendered.append(rl)
+                    for rtok in entry["proxy_raws"]:
+                        rendered.append(f"{' ' * item_ind}- {rtok}")
+                    skipping_proxies_items = True
+                    proxies_indent = ind
+                continue
+
+        up = _upgrade_line(rl)
+        if force_select and re.match(r"^\s*(?:-\s+)?type\s*:", cl):
+            code, comment = _split_inline_comment(up)
+            code = re.sub(r"^(\s*(?:-\s+)?type\s*:\s*).*$", r"\1select", code, flags=re.I)
+            up = f"{code}{comment}"
+        if is_auto and re.match(r"^\s*lazy\s*:", cl):
+            code, comment = _split_inline_comment(up)
+            code = re.sub(r"^(\s*lazy\s*:\s*).*$", r"\1true", code, flags=re.I)
+            up = f"{code}{comment}"
+            seen_lazy = True
+        elif is_auto and re.match(r"^\s*interval\s*:", cl):
+            lazy_insert_idx = len(rendered) + 1
+        rendered.append(up)
+
+    if is_auto and not seen_lazy:
+        lazy_line = f"{' ' * key_indent}lazy: true"
+        if 0 <= lazy_insert_idx <= len(rendered):
+            rendered.insert(lazy_insert_idx, lazy_line)
+        else:
+            rendered.append(lazy_line)
+
+    return rendered + trailing_blanks
+
+
+def _harden_flclash_proxy_groups(
+    group_lines: list[tuple[int, str]],
+    min_interval: int = 300,
+    protected_groups: set[str] | None = None,
+) -> list[str]:
+    if not group_lines:
+        return []
+    entries = _parse_proxy_group_entries(group_lines)
+    if not entries:
+        return [
+            re.sub(
+                r"((?:^|\s|[,{])interval\s*:\s*)(\d+)",
+                lambda m: f"{m.group(1)}{max(int(m.group(2)), min_interval)}",
+                re.sub(
+                    r"""((?:^|\s|[,{])url\s*:\s*['"]?)http://([^\s'"#},]+)""",
+                    r"\1https://\2",
+                    raw,
+                ),
+            )
+            for _, raw in group_lines
+        ]
+
+    protected = set(protected_groups or ())
+
+    # Pass 1: Flatten singleton auto-test groups (fallback/url-test/load-balance with 1 member)
+    candidate_replacements: dict[str, tuple[str, str]] = {}
+    for e in entries:
+        if (
+            e["type"] in AUTO_TEST_GROUP_TYPES
+            and not e["has_use"]
+            and not e["has_include_all"]
+            and e["name"] not in protected
+            and e["proxies"] is not None
+            and len(e["proxies"]) == 1
+            and e["proxies"][0] != e["name"]
+        ):
+            candidate_replacements[e["name"]] = (e["proxies"][0], e["proxy_raws"][0])
+
+    # Break any replacement cycle (e.g. G1 -> G2 -> G1) so cyclic groups are never deleted leaving dangling refs
+    replacements: dict[str, tuple[str, str]] = {}
+    for gname, target in candidate_replacements.items():
+        seen_chain = {gname}
+        cur_t = target[0]
+        cyclic = False
+        while cur_t in candidate_replacements:
+            if cur_t in seen_chain:
+                cyclic = True
+                break
+            seen_chain.add(cur_t)
+            cur_t = candidate_replacements[cur_t][0]
+        if not cyclic:
+            replacements[gname] = target
+
+    kept = [e for e in entries if e["name"] not in replacements]
+    changed_map: dict[str, bool] = {}
+    for e in kept:
+        if e["proxies"] is not None and e["proxy_raws"] is not None and replacements:
+            nd, nr, chg = _dedup_proxy_members(e["proxies"], e["proxy_raws"], replacements)
+            e["proxies"], e["proxy_raws"] = nd, nr
+            changed_map[e["name"]] = chg
+        else:
+            changed_map[e["name"]] = False
+
+    # Pass 2: Prune unreachable orphan auto-test groups when root select/relay/protected groups exist
+    by_name = {e["name"]: e for e in kept}
+    roots = protected | {e["name"] for e in kept if e["type"] in {"select", "relay"}}
+    if roots:
+        reachable: set[str] = set()
+        queue = list(roots)
+        while queue:
+            cur_name = queue.pop(0)
+            if cur_name in reachable:
+                continue
+            reachable.add(cur_name)
+            grp = by_name.get(cur_name)
+            if grp and grp["proxies"]:
+                for child in grp["proxies"]:
+                    if child in by_name and child not in reachable:
+                        queue.append(child)
+        pruned_orphans = [
+            e["name"]
+            for e in kept
+            if e["type"] in AUTO_TEST_GROUP_TYPES
+            and not e["has_use"]
+            and not e["has_include_all"]
+            and e["name"] not in reachable
+            and e["name"] not in protected
+        ]
+        if pruned_orphans:
+            orphan_set = set(pruned_orphans)
+            kept = [e for e in kept if e["name"] not in orphan_set]
+    else:
+        pruned_orphans = []
+
+    # Pass 3: Convert protected/remaining singleton auto-test groups (e.g. 1-node self-hosted VPS) to select
+    for e in kept:
+        if (
+            e["type"] in AUTO_TEST_GROUP_TYPES
+            and not e["has_use"]
+            and not e["has_include_all"]
+            and e["proxies"] is not None
+            and len(e["proxies"]) <= 1
+        ):
+            e["force_select"] = True
+            print(
+                f"[INFO]  Converted single-member '{e['type']}' group '{e['name']}' to 'select' "
+                "(avoids redundant health checks on <=1 node)"
+            )
+
+    removed_count = len(replacements) + len(pruned_orphans)
+    if removed_count:
+        print(
+            f"[INFO]  Streamlined {removed_count} redundant/orphan health-check proxy-group(s) "
+            f"(inlined_singleton={len(replacements)}, pruned_orphan={len(pruned_orphans)}, lazy=true, interval>={min_interval}s)"
+        )
+
+    out: list[str] = [group_lines[0][1]]
+    for _, raw in group_lines[1:]:
+        st = raw.strip()
+        if not st or st.startswith("#"):
+            out.append(raw)
+        else:
+            break
+    for e in kept:
+        out.extend(_render_hardened_group_lines(e, min_interval, changed_map.get(e["name"], False)))
+    return out
+
+
+def _harden_flclash_proxy_providers(
+    provider_lines: list[tuple[int, str]],
+    min_interval: int = 300,
+) -> list[str]:
+    """Harden optional proxy-providers health-check blocks (HTTPS URL, interval >= 300s, lazy: true)."""
+    if not provider_lines:
+        return []
+
+    def _upgrade_hc_flow(flow_text: str) -> str:
+        t = re.sub(
+            r"""((?:^|\s|[,{])url\s*:\s*['"]?)http://([^\s'"#},]+)""",
+            r"\1https://\2",
+            flow_text,
+        )
+        t = re.sub(
+            r"((?:^|\s|[,{])interval\s*:\s*)(\d+)",
+            lambda m: f"{m.group(1)}{max(int(m.group(2)), min_interval)}",
+            t,
+        )
+        if not re.search(r"(?:^|\s|[,{])enable\s*:\s*false\b", t, flags=re.I):
+            if re.search(r"(?:^|\s|[,{])lazy\s*:", t):
+                t = re.sub(r"((?:^|\s|[,{])lazy\s*:\s*)(?:true|false)", r"\1true", t, flags=re.I)
+            else:
+                idx = t.rfind("}")
+                if idx != -1:
+                    before = t[:idx].rstrip()
+                    sep = "" if before.endswith("{") else ", "
+                    t = f"{before}{sep}lazy: true{t[idx:]}"
+        return t
+
+    out: list[str] = [provider_lines[0][1]]
+    in_hc = False
+    hc_indent = -1
+    hc_child_indent = -1
+    hc_seen_lazy = False
+    hc_disabled = False
+
+    def _flush_hc() -> None:
+        nonlocal in_hc, hc_indent, hc_child_indent, hc_seen_lazy, hc_disabled
+        if in_hc and not hc_disabled and not hc_seen_lazy:
+            ind = hc_child_indent if hc_child_indent > hc_indent else (hc_indent + 2)
+            out.append(f"{' ' * ind}lazy: true")
+        in_hc = False
+        hc_indent = -1
+        hc_child_indent = -1
+        hc_seen_lazy = False
+        hc_disabled = False
+
+    for _, raw in provider_lines[1:]:
+        code, comment = _split_inline_comment(raw)
+        s = code.strip()
+        if not s:
+            out.append(raw)
+            continue
+        indent = len(code) - len(code.lstrip())
+        if in_hc and indent <= hc_indent:
+            _flush_hc()
+
+        if not in_hc:
+            m_hc_inline = re.search(r"\bhealth-check\s*:\s*(\{.*\})", code)
+            if m_hc_inline:
+                upgraded = _upgrade_hc_flow(m_hc_inline.group(1))
+                code = code[: m_hc_inline.start(1)] + upgraded + code[m_hc_inline.end(1) :]
+                out.append(f"{code}{comment}")
+                continue
+            if re.match(r"^health-check\s*:\s*$", s):
+                in_hc = True
+                hc_indent = indent
+                hc_child_indent = -1
+                hc_seen_lazy = False
+                hc_disabled = False
+                out.append(raw)
+                continue
+            out.append(raw)
+            continue
+
+        # Inside block-style health-check:
+        if hc_child_indent == -1:
+            hc_child_indent = indent
+        if re.match(r"^enable\s*:\s*false\b", s, flags=re.I):
+            hc_disabled = True
+        elif re.match(r"^url\s*:", s, flags=re.I):
+            code = re.sub(
+                r"""(url\s*:\s*['"]?)http://([^\s'"#},]+)""",
+                r"\1https://\2",
+                code,
+                flags=re.I,
+            )
+        elif re.match(r"^interval\s*:", s, flags=re.I):
+            code = re.sub(
+                r"(interval\s*:\s*)(\d+)",
+                lambda m: f"{m.group(1)}{max(int(m.group(2)), min_interval)}",
+                code,
+                flags=re.I,
+            )
+        elif re.match(r"^lazy\s*:", s, flags=re.I):
+            hc_seen_lazy = True
+            if not hc_disabled:
+                code = re.sub(r"^(\s*lazy\s*:\s*).*$", r"\1true", code, flags=re.I)
+        out.append(f"{code}{comment}")
+
+    _flush_hc()
+    return out
+
+
+def _harden_flclash_proxies(proxy_lines: list[tuple[int, str]]) -> list[str]:
+    """Ensure VLESS nodes explicitly enable packet-encoding: xudp while preserving comments and order."""
+    if not proxy_lines:
+        return []
+    entries = _extract_proxy_entries(proxy_lines)
+    if not entries:
+        return [raw for _, raw in proxy_lines]
+
+    out: list[str] = [proxy_lines[0][1]]
+    for _, raw in proxy_lines[1:]:
+        st = raw.strip()
+        if not st or st.startswith("#"):
+            out.append(raw)
+        else:
+            break
+
+    updated = 0
+    for e in entries:
+        lines = list(e["lines"])
+        if e["type"] == "vless" and e["packet_encoding"] != "xudp":
+            if e["is_flow"]:
+                code, comment = _split_inline_comment(lines[0])
+                if e["packet_encoding"]:
+                    code = re.sub(
+                        r"""(\bpacket-encoding\s*:\s*)(?:"[^"]*"|'[^']*'|[^,}\s]+)""",
+                        r"\1xudp",
+                        code,
+                        count=1,
+                        flags=re.I,
+                    )
+                    lines[0] = f"{code}{comment}"
+                    updated += 1
+                else:
+                    idx = code.rfind("}")
+                    if idx != -1:
+                        before = code[:idx].rstrip()
+                        sep = "" if before.endswith("{") else ", "
+                        lines[0] = f"{before}{sep}packet-encoding: xudp{code[idx:]}{comment}"
+                        updated += 1
+            elif e["packet_encoding_line_idx"] is not None:
+                pidx = e["packet_encoding_line_idx"]
+                code, comment = _split_inline_comment(lines[pidx])
+                code = re.sub(
+                    r"^(\s*(?:-\s+)?packet-encoding\s*:\s*).*$",
+                    r"\1xudp",
+                    code,
+                    count=1,
+                    flags=re.I,
+                )
+                lines[pidx] = f"{code}{comment}"
+                updated += 1
+            elif e["type_line_idx"] is not None:
+                xudp_line = f"{' ' * e['key_indent']}packet-encoding: xudp"
+                lines.insert(e["type_line_idx"] + 1, xudp_line)
+                updated += 1
+        out.extend(lines)
+
+    if updated:
+        print(f"[INFO]  Normalized 'packet-encoding: xudp' on {updated} VLESS proxy node(s)")
     return out
 
 
 def _build_hardened_yaml_dns_and_sniffer(
     proxy_group: str,
-    providers: set[str],
-    existing_dns_lines: list[tuple[int, str]],
+    bundles: dict[str, object],
     apple_mode: str = "b",
 ) -> tuple[list[str], list[str]]:
-    """Build hardened Layer 0 dns and sniffer YAML blocks with aligned Microsoft/Apple DoH routing."""
-    # Preserve custom proxy-server-nameserver if present in airport config
     proxy_ns = list(FLCLASH_PROXY_SERVER_NAMESERVER)
-    in_pns = False
-    extracted_pns: list[str] = []
-    for _, raw in existing_dns_lines:
-        s = raw.strip()
-        if s.startswith("proxy-server-nameserver:"):
-            in_pns = True
-            continue
-        if in_pns:
-            if s.startswith("- "):
-                extracted_pns.append(s[2:].strip())
-            elif s and not s.startswith("#"):
-                in_pns = False
-    if extracted_pns:
-        proxy_ns = extracted_pns
 
     dns_lines = [
         "dns:",
@@ -992,18 +1487,13 @@ def _build_hardened_yaml_dns_and_sniffer(
         "    fake-ip-filter:",
     ]
     for item in FLCLASH_FAKE_IP_FILTER_BASE:
-        if item.startswith("rule-set:") and item.split(":", 1)[1] not in providers:
-            continue
         dns_lines.append(f"        - {item}")
 
     dns_lines.append("    default-nameserver:")
     for ns in FLCLASH_DEFAULT_NAMESERVER:
         dns_lines.append(f"        - {ns}")
 
-    overseas_doh = (
-        f'"https://dns.google/dns-query#{proxy_group}"',
-        f'"https://1.1.1.1/dns-query#{proxy_group}"',
-    )
+    overseas_doh = tuple(f'"{base}#{proxy_group}"' for base in FLCLASH_OVERSEAS_DOH_BASES)
     dns_lines.append("    nameserver:")
     for srv in overseas_doh:
         dns_lines.append(f"        - {srv}")
@@ -1016,26 +1506,36 @@ def _build_hardened_yaml_dns_and_sniffer(
             seen_policy_keys.add(key)
             policy_entries.append((key, servers))
 
-    # Order most-specific to broadest so exceptions cleanly override parent wildcards & cn-domain.
+    for dom in FLCLASH_DNS_AD_REJECT_EXACT:
+        _add_ns_policy(dom, ("rcode://name_error",))
+    for dom in FLCLASH_DNS_AD_REJECT_SUFFIXES:
+        _add_ns_policy(f"+.{dom}", ("rcode://name_error",))
     for dom in MS_61_DIRECT:
+        _add_ns_policy(f"+.{dom}", FLCLASH_DOMESTIC_DOH)
+    for dom in sorted(bundles["bing_cn_roots"]):
         _add_ns_policy(f"+.{dom}", FLCLASH_DOMESTIC_DOH)
     for dom in (*MICROSOFT_AI_SUFFIXES, *MS_61_PROXY_8):
         _add_ns_policy(f"+.{dom}", overseas_doh)
-    apple_overseas = APPLE_COMMON_SUFFIXES if apple_mode == "b" else APPLE_SR_US_ONLY_SUFFIXES
-    for dom in apple_overseas:
-        _add_ns_policy(f"+.{dom}", overseas_doh)
+    if apple_mode == "b":
+        for dom in (*APPLE_COMMON_SUFFIXES, *APPLE_SAFEBROWSING_OHTTP_SUFFIXES):
+            _add_ns_policy(f"+.{dom}", overseas_doh)
+    else:
+        for dom in APPLE_SR_US_ONLY_SUFFIXES:
+            _add_ns_policy(f"+.{dom}", overseas_doh)
+        for dom in APPLE_COMMON_SUFFIXES:
+            _add_ns_policy(f"+.{dom}", FLCLASH_DOMESTIC_DOH)
     for dom in MICROSOFT_COMMON_SUFFIXES:
         _add_ns_policy(f"+.{dom}", FLCLASH_DOMESTIC_DOH)
+    for arpa in FLCLASH_DNS_ARPA_SUFFIXES:
+        _add_ns_policy(f"+.{arpa}", ("rcode://name_error",))
     for rs in ("cn-domain", "private"):
-        if rs in providers:
-            _add_ns_policy(f"rule-set:{rs}", FLCLASH_DOMESTIC_DOH)
+        _add_ns_policy(f"rule-set:{rs}", FLCLASH_DOMESTIC_DOH)
 
-    if policy_entries:
-        dns_lines.append("    nameserver-policy:")
-        for key, servers in policy_entries:
-            dns_lines.append(f'        "{key}":')
-            for srv in servers:
-                dns_lines.append(f"            - {srv}")
+    dns_lines.append("    nameserver-policy:")
+    for key, servers in policy_entries:
+        dns_lines.append(f'        "{key}":')
+        for srv in servers:
+            dns_lines.append(f"            - {srv}")
 
     dns_lines.append("    proxy-server-nameserver:")
     for pns in proxy_ns:
@@ -1044,10 +1544,11 @@ def _build_hardened_yaml_dns_and_sniffer(
     sniffer_lines = [
         "sniffer:",
         "    enable: true",
+        "    force-dns-mapping: true",
         "    parse-pure-ip: true",
         "    sniff:",
         "        HTTP:",
-        '            ports: ["80", 8080-8880]',
+        '            ports: ["80", "8080"]',
         "        QUIC:",
         '            ports: ["443", "8443"]',
         "        TLS:",
@@ -1060,152 +1561,132 @@ def _build_hardened_yaml_dns_and_sniffer(
     return dns_lines, sniffer_lines
 
 
-def _extract_specialized_airport_rules(
-    rules_block: list[tuple[int, str]],
-    main_group: str,
-    defined_groups: set[str],
-    provider_behaviors: dict[str, str] | None = None,
-) -> list[str]:
-    """Preserve non-main specialized proxy-group routes from base YAML (e.g. Emby/Streaming/Game)."""
-    if not rules_block:
-        return []
-    specialized: list[str] = []
-    ignored_targets = {main_group, *BUILTIN_MIHOMO_ACTIONS}
-    for _, raw in rules_block[1:]:
-        s = raw.strip()
-        if not s or s.startswith("#") or not s.startswith("-"):
-            continue
-        item = _strip_yaml_quotes(_strip_inline_comment(s[1:].strip()))
-        if not item:
-            continue
-        parts = [p.strip() for p in item.split(",")]
-        if len(parts) < 2:
-            continue
-        act = parts[-2] if parts[-1].lower() == "no-resolve" and len(parts) >= 3 else parts[-1]
-        act_clean = _strip_yaml_quotes(act)
-        if act_clean in defined_groups and act_clean not in ignored_targets:
-            if parts[0].upper() == "RULE-SET" and parts[-1].lower() != "no-resolve":
-                item = _flclash_ruleset_rule(parts[1], act_clean, provider_behaviors)
-            specialized.append(item)
-    return specialized
+def _build_inline_rule_providers_yaml(bundles: dict[str, object]) -> list[str]:
+    """Emit local inline `behavior: domain` providers so FlClash needs zero airport/remote URLs."""
+    lines = ["rule-providers:"]
+    for pname, payload in (
+        ("private", bundles["private_domain_payload"]),
+        ("cn-domain", bundles["cn_inline_payload"]),
+    ):
+        lines.extend(
+            [
+                f"    {pname}:",
+                "        type: inline",
+                "        behavior: domain",
+                "        payload:",
+            ]
+        )
+        for dom in payload:
+            lines.append(f"            - '{dom}'")
+    return lines
 
 
 def build_flclash(
     out_path: pathlib.Path,
     base_yaml: pathlib.Path,
-    sr_source: pathlib.Path,
-    ads_ruleset: pathlib.Path | None = None,
+    dlc_source: pathlib.Path,
     proxy_group: str | None = None,
     apple_mode: str = "b",
-    zoom_mode: str = "direct",
-    strict_auth0: bool = False,
+    strict_auth0: bool = True,
     drop_geoip_cn: bool = False,
+    direct_cidrs: tuple[str, ...] = (),
 ) -> int:
-    """Build a hardened FlClash/Mihomo .yaml for Win/Android preserving airport nodes and groups."""
+    """Build a pure-DLC single-file FlClash/Mihomo .yaml keeping ONLY proxies, optional proxy-providers, and proxy-groups from --base."""
     raw_lines = base_yaml.read_text(encoding="utf-8", errors="replace").splitlines()
     blocks = _extract_yaml_top_blocks(raw_lines)
     defined_groups = _extract_proxy_group_names(blocks.get("proxy-groups", []))
+    if not defined_groups:
+        raise ValueError("Base YAML must declare at least one group in 'proxy-groups:'")
     target_group = proxy_group or _detect_primary_select_group(blocks.get("proxy-groups", []))
     if not target_group:
         raise ValueError("Could not auto-detect primary select proxy-group; pass --proxy-group explicitly")
-    if defined_groups and target_group not in defined_groups:
+    if target_group not in defined_groups:
         raise ValueError(f"Proxy group '{target_group}' not found in base YAML proxy-groups: {sorted(defined_groups)}")
 
-    providers, bytedance_prov, provider_behaviors = _parse_provider_blocks(blocks.get("rule-providers", []))
-    ads_filter = None
-    if ads_ruleset and ads_ruleset.is_file():
-        sfx, exact, cache_warns = load_ads_domain_set(ads_ruleset)
-        for w in cache_warns:
-            print(f"[WARN]  {w}")
-        ads_filter = (sfx, exact)
+    dlc = DlcCatalog.from_source(dlc_source)
+    bundles = _prepare_dlc_bundles(dlc, apple_mode=apple_mode)
 
-    sr_reject_dom, sr_reject_ip, sr_direct, sr_proxy = parse_sr_upstream(sr_source)
-    specialized_rules = _extract_specialized_airport_rules(
-        blocks.get("rules", []),
-        main_group=target_group,
-        defined_groups=defined_groups,
-        provider_behaviors=provider_behaviors,
-    )
-    if specialized_rules:
-        print(f"[INFO]  Preserved {len(specialized_rules)} specialized airport rule(s) targeting non-main groups")
-
-    # Assemble Layer 0 top blocks preserving proxies / proxy-groups / extra keys from base
     top_scalars = [
         "mixed-port: 7890",
         "mode: rule",
         "log-level: info",
         "ipv6: false",
         "unified-delay: true",
+        "tcp-concurrent: true",
+        "keep-alive-interval: 15",
+        "keep-alive-idle: 600",
+    ]
+    profile_lines = [
+        "profile:",
+        "    store-selected: true",
+        "    store-fake-ip: true",
     ]
     dns_lines, sniffer_lines = _build_hardened_yaml_dns_and_sniffer(
         proxy_group=target_group,
-        providers=providers,
-        existing_dns_lines=blocks.get("dns", []),
+        bundles=bundles,
         apple_mode=apple_mode,
     )
-    prov_lines = _rewrite_rule_providers_behavior(blocks.get("rule-providers", []))
-
-    head_lines: list[str] = [*top_scalars, ""]
-    # Replace base top-level scalars cleanly and drop port/socks-port/allow-lan to minimize LAN exposure.
-    handled_keys = {
-        "mixed-port", "port", "socks-port", "allow-lan", "mode", "log-level",
-        "ipv6", "unified-delay", "dns", "sniffer", "rule-providers", "rules",
+    raw_proxy_entries = _extract_proxy_entries(blocks.get("proxies", []))
+    raw_provider_entries = _parse_proxy_provider_entries(blocks.get("proxy-providers", []))
+    referenced_relay_groups = {
+        e["dialer_proxy"] for e in raw_proxy_entries if e.get("dialer_proxy")
+    } | {
+        info["proxy"] for info in raw_provider_entries.values() if info.get("proxy")
     }
+    proxy_lines = _harden_flclash_proxies(blocks.get("proxies", []))
+    proxy_provider_lines = _harden_flclash_proxy_providers(blocks.get("proxy-providers", []))
+    group_lines = _harden_flclash_proxy_groups(
+        blocks.get("proxy-groups", []),
+        protected_groups={target_group, *referenced_relay_groups},
+    )
+    prov_lines = _build_inline_rule_providers_yaml(bundles)
+
+    emitter = RuleEmitter("flclash")
+    c = _emit_all_layers(
+        emitter,
+        proxy_target=target_group,
+        platform="flclash",
+        dlc=dlc,
+        bundles=bundles,
+        apple_mode=apple_mode,
+        strict_auth0=strict_auth0,
+        drop_geoip_cn=drop_geoip_cn,
+        direct_cidrs=direct_cidrs,
+    )
+
+    head_lines: list[str] = [*top_scalars, "", *profile_lines, ""]
     head_lines.extend(dns_lines)
     head_lines.append("")
     head_lines.extend(sniffer_lines)
     head_lines.append("")
 
-    for key, blk in blocks.items():
-        if key in handled_keys:
-            continue
-        head_lines.extend(raw for _, raw in blk)
-        if blk and blk[-1][1].strip():
+    if proxy_lines:
+        head_lines.extend(proxy_lines)
+        if proxy_lines[-1].strip():
             head_lines.append("")
 
-    if prov_lines:
-        head_lines.extend(prov_lines)
-        if prov_lines[-1].strip():
+    if proxy_provider_lines:
+        head_lines.extend(proxy_provider_lines)
+        if proxy_provider_lines[-1].strip():
             head_lines.append("")
 
+    if group_lines:
+        head_lines.extend(group_lines)
+        if group_lines[-1].strip():
+            head_lines.append("")
+
+    head_lines.extend(prov_lines)
+    head_lines.append("")
     head_lines.append("rules:")
-
-    emitter = RuleEmitter("flclash")
-    c15 = _emit_common_layers_1_to_5(
-        emitter,
-        proxy_target=target_group,
-        platform="flclash",
-        sr_reject_dom=sr_reject_dom,
-        sr_reject_ip=sr_reject_ip,
-        strict_auth0=strict_auth0,
-        ads_filter=ads_filter,
-        lite_mode=False,
-        apple_mode=apple_mode,
-        available_providers=providers,
-        provider_behaviors=provider_behaviors,
-    )
-    c69 = _emit_common_layers_6_to_9(
-        emitter,
-        proxy_target=target_group,
-        platform="flclash",
-        sr_direct=sr_direct,
-        sr_proxy=sr_proxy,
-        apple_mode=apple_mode,
-        zoom_mode=zoom_mode,
-        available_providers=providers,
-        provider_behaviors=provider_behaviors,
-        bytedance_provider=bytedance_prov,
-        drop_geoip_cn=drop_geoip_cn,
-        custom_preserved_rules=specialized_rules,
-    )
 
     content = "\n".join(head_lines + emitter.lines) + "\n"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(content.encode("utf-8"))
 
     print(
-        f"[BUILD] FlClash (group={target_group}, Apple={apple_mode.upper()}) -> {out_path} "
-        f"(ad_extra={c15['ad']}, top500_direct={c69['direct']}, sr_proxy={c69['proxy']}, rules={emitter.rule_count})"
+        f"[BUILD] FlClash (DLC inline, group={target_group}, Apple={apple_mode.upper()}) -> {out_path} "
+        f"(ads={c['ad']}, overseas={c['overseas']}, cn_delta={c['cn_delta']}, "
+        f"inline_cn={len(bundles['cn_inline_payload'])}, rules={emitter.rule_count})"
     )
     for note in emitter.notes[:20]:
         print(f"[NOTE]  {note}")
@@ -1214,86 +1695,118 @@ def build_flclash(
 
     report = audit_flclash(out_path, strict=True, apple_mode=apple_mode)
     print(format_report(report))
-    return 1 if report.errors else 0
+    return 1 if (report.errors or report.warnings) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Deterministically build and harden Shadowrocket (.conf) or FlClash/Mihomo (.yaml) configs."
+        description="Deterministically build pure-DLC Shadowrocket (.conf) or FlClash/Mihomo (.yaml) configs."
     )
     parser.add_argument("--mode", choices=["sr", "flclash"], required=True, help="Target platform config format")
-    parser.add_argument("--sr-source", type=pathlib.Path, required=True, help="Path to sr_top500_whitelist_ad.conf")
     parser.add_argument(
-        "--fetch-sr",
-        action="store_true",
-        help="Fetch public sr_top500_whitelist_ad.conf to --sr-source before building",
-    )
-    parser.add_argument(
-        "--ads-ruleset",
+        "--dlc-source",
         type=pathlib.Path,
-        help="Optional cached Clash ads.yaml; omitted with native 'ads' provider keeps rules minimal (~1k), passed diffs upstream ad gaps",
+        required=True,
+        help="Path to dlc.dat_plain.yml or a local domain-list-community/data directory",
     )
-    parser.add_argument("--rulesets-dir", type=pathlib.Path, help="Optional cached Clash rulesets dir for SR inlining")
-    parser.add_argument("--user-conf", type=pathlib.Path, help="Optional existing SR .conf to preserve custom rules")
-    parser.add_argument("--base", type=pathlib.Path, help="Required for --mode flclash: native airport .yaml")
+    parser.add_argument(
+        "--fetch-dlc",
+        action="store_true",
+        help="Download official dlc.dat_plain.yml (+ SHA-256 verify) to --dlc-source before building",
+    )
+    parser.add_argument(
+        "--user-conf",
+        type=pathlib.Path,
+        help="Optional personal SR .conf for small built-in PROXY/DIRECT/REJECT overrides (never pass raw airport .conf)",
+    )
+    parser.add_argument(
+        "--base",
+        type=pathlib.Path,
+        help="Required for --mode flclash: base .yaml supplying proxies, proxy-groups, and optional proxy-providers only (all original dns/rules/rule-providers are ignored)",
+    )
     parser.add_argument("--proxy-group", help="Override FlClash main select proxy group name")
-    parser.add_argument("--profile", choices=["lite", "full"], default="lite", help="SR profile (default: lite)")
     parser.add_argument(
         "--apple",
         choices=["auto", "a", "b"],
         default="auto",
         help="Apple split strategy (auto: 'a' for SR iOS, 'b' for FlClash Win/Android)",
     )
-    parser.add_argument("--zoom", choices=["direct", "proxy"], default="direct", help="zoom.us routing (default: direct)")
-    parser.add_argument("--strict-auth0", action="store_true", help="Do not whitelist bare auth0.com in Layer 2.1")
+    parser.add_argument(
+        "--broad-auth0",
+        action="store_true",
+        help="Opt-in: allow broad auth0.com in Layer 2.1 (default keeps strict auth0.openai.com via openai.com)",
+    )
     parser.add_argument(
         "--drop-geoip-cn",
         action="store_true",
-        help="Omit redundant GEOIP,CN in FlClash when cn-ip provider exists (low-memory option)",
+        help="Omit fallback GEOIP,CN in FlClash (low-memory option)",
+    )
+    parser.add_argument(
+        "--direct-cidr",
+        action="append",
+        default=[],
+        help="Optional IPv4/IPv6 IP or CIDR to pin DIRECT at Layer 1 (anti-loopback for self-hosted VPS IP)",
     )
     parser.add_argument("--name", default="Hardened-iOS-Shadowrocket", help="Shadowrocket #!name header")
     parser.add_argument("--desc", default="", help="Shadowrocket #!desc header")
     parser.add_argument("-o", "--out", type=pathlib.Path, required=True, help="Output file path")
     args = parser.parse_args(argv)
 
-    if args.fetch_sr:
-        fetch_sr_whitelist(args.sr_source)
-    if not args.sr_source.is_file():
-        print(f"[ERROR] --sr-source not found: {args.sr_source}", file=sys.stderr)
+    if args.fetch_dlc:
+        if args.dlc_source.is_dir():
+            print("[ERROR] --fetch-dlc requires --dlc-source to be a file path (e.g. dlc.dat_plain.yml)", file=sys.stderr)
+            return 2
+        fetch_dlc_plain(args.dlc_source)
+
+    if not args.dlc_source.exists():
+        print(f"[ERROR] --dlc-source not found: {args.dlc_source}", file=sys.stderr)
         return 2
 
     apple = args.apple
     if apple == "auto":
         apple = "a" if args.mode == "sr" else "b"
 
+    strict_auth0 = not args.broad_auth0
+    validated_direct_cidrs: list[str] = []
+    for raw_cidr in args.direct_cidr:
+        c = raw_cidr.strip()
+        if not c:
+            continue
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+        except ValueError:
+            print(
+                f"[ERROR] Invalid --direct-cidr value '{c}': must be an IPv4/IPv6 address or CIDR (not a hostname)",
+                file=sys.stderr,
+            )
+            return 2
+        validated_direct_cidrs.append(str(net))
+    direct_cidrs = tuple(validated_direct_cidrs)
+
     if args.mode == "sr":
         return build_shadowrocket(
             out_path=args.out,
-            sr_source=args.sr_source,
-            profile=args.profile,
+            dlc_source=args.dlc_source,
             apple_mode=apple,
-            zoom_mode=args.zoom,
-            strict_auth0=args.strict_auth0,
-            rulesets_dir=args.rulesets_dir,
-            ads_ruleset=args.ads_ruleset,
+            strict_auth0=strict_auth0,
             user_conf=args.user_conf,
+            direct_cidrs=direct_cidrs,
             name=args.name,
             desc=args.desc,
         )
 
     if not args.base or not args.base.is_file():
-        print("[ERROR] --base <airport.yaml> is required for --mode flclash", file=sys.stderr)
+        print("[ERROR] --base <base.yaml> is required for --mode flclash", file=sys.stderr)
         return 2
     return build_flclash(
         out_path=args.out,
         base_yaml=args.base,
-        sr_source=args.sr_source,
-        ads_ruleset=args.ads_ruleset,
+        dlc_source=args.dlc_source,
         proxy_group=args.proxy_group,
         apple_mode=apple,
-        zoom_mode=args.zoom,
-        strict_auth0=args.strict_auth0,
+        strict_auth0=strict_auth0,
         drop_geoip_cn=args.drop_geoip_cn,
+        direct_cidrs=direct_cidrs,
     )
 
 

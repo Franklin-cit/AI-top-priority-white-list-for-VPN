@@ -51,8 +51,13 @@
 ### 1. 小火箭软件内设置
 1. **全局路由**：首页顶部务必选择 **「配置」**（不要长开「代理」或「直连」；仅在复测全站统一出口/无视规则分流时临时切到「代理」）。
 2. **启用新配置**：底部 **「配置」** 标签 → 点击增强后的 `.conf` 文件 → **「使用配置」**。
-3. **UDP 转发（必查）**：首页节点列表 → 点击当前节点右侧 **`i`** → 确认 **「UDP 转发」开启**。若开启后配合增强版 `block-quic = all-proxy` 与第 1.5 层规则，ChatGPT/Gemini 实时语音通话与 QQ/微信 UDP 均不受影响，而普通网页 QUIC 仍会被稳定抑制回退 TCP。
-4. **「始终开启」与「按需连接」的选择（在 `设置 → 按需连接` / `按需求连接` 中）**：
+3. **UDP 转发与 IPv6 开关（必查）**：
+   - 首页节点列表 → 点击当前节点右侧 **`i`** → 确认 **「UDP 转发」开启**。若开启后配合增强版 `block-quic = all-proxy` 与第 1.5 层规则，ChatGPT/Gemini 实时语音通话与 QQ/微信 UDP 均不受影响，而普通网页 QUIC 与腾讯广告 UDP 443 仍会被稳定抑制。
+   - **IPv6 说明（对应 [Shadowrocket 使用手册](https://lowertop.github.io/Shadowrocket/)）**：App 的「设置 → 隧道」中没有独立的全局 IPv6 开关；`ipv6 = false` 与 `prefer-ipv6 = false` 位于配置文件 `[General]` 段，可在底部 **「配置 → 点击当前 `.conf` 右侧 `i` → 编辑配置 → 通用（或编辑纯文本）」** 中核对（本配置已默认关闭）。另按该手册提醒：即使 `ipv6 = false`，若当前网络支持 IPv6 且**节点域名本身带有 AAAA 记录**，连接节点时仍可能走 IPv6，此时可在 `[Host]` 为节点域名绑定 IPv4 或在客户端避免节点域名 IPv6 解析。
+4. **STUN 与日志管理（实机日志经验）**：
+   - **保持开启「禁用 STUN」**：防止 WebRTC STUN 探测穿透代理暴露真实 IP；不要为了消除日志中 `disallow stun` 记录去全局放行 STUN 或全局封禁 `3478` 端口（B 站 PCDN 刷屏已在第 3.1 层精准拦截；`httpdns.bilivideo.com` 经全量日志审计确认仅服务 B 站正常选线且无 STUN 泄漏，**保留 `DIRECT` 放行，切勿加入拦截**）。
+   - **日常关闭 PacketTunnel 详细调试日志**：高并发 P2P 期间详细调试日志可达 40+ MB/小时，完成规则回归验证后记得在日志页面关闭详细记录以省电降耗。
+5. **「始终开启」与「按需连接」的选择（在 `设置 → 按需连接` / `按需求连接` 中）**：
    - **两者关系**：在小火箭菜单中，两者均位于「按需连接」子页面（对应 iOS 系统 VPN 设置里的系统级 On-Demand）；若**同时打开，以「始终开启」优先生效**。
    - **日常推荐「按需连接（配置默认连接规则，如蜂窝/陌生 Wi-Fi 自动连接，仅对认证/已代理 Wi-Fi 设断开）」**：
      - 切网（Wi-Fi ↔ 5G）或睡醒恢复时自动接管防泄露；
@@ -60,13 +65,16 @@
      - 不会像「始终开启」那样在连接**校园网 / 酒店 / 商场 Portal 认证 Wi-Fi** 时抢占流量导致认证页打不开或断流死锁，也不易在大规则触及 iOS PacketTunnel 扩展内存配额被强杀时陷入“强杀 → 秒拉起 → 再杀”的发热耗电循环。
    - **何时改开「始终开启（Always On）」**：仅当你对**防瞬间裸连**要求极高（如常驻登录高风控海外账号、绝不允许任何时刻走直连且几乎不连公共认证 Wi-Fi），并配合稳定的轻量版配置时再开启（开启后若需手动关闭代理，需先回到该子菜单关闭「始终开启」）。
    - *注*：不建议仅使用“访问少数特定域名才唤醒”的按需方式，那样在唤醒瞬间容易发生本地 DNS 先查询泄露。
-5. **不写入 `[Proxy]` 段**：机场节点仍在首页通过原订阅链接更新与选择，`.conf` 中的 `PROXY` 策略自动对接首页当前选中节点；机场更换服务器 IP 时仅需在首页刷新节点订阅，**不会破坏 `.conf` 分流规则**。
-6. **避免无必要的全量抓包/多余解密**：仅保留配置末尾针对 Google `.cn` 的 `[MITM] hostname = *.google.cn` 与 `[URL Rewrite]`，不额外开启全局 HTTPS 解密，保证带宽与续航。
+6. **不写入 `[Proxy]` 段与本地节点域名直析可选 `[Host]`**：机场节点仍在首页通过原订阅链接更新与选择，`.conf` 中的 `PROXY` 策略自动对接首页当前选中节点；机场更换服务器 IP 时仅需在首页刷新节点订阅，**不会破坏 `.conf` 分流规则**。若机场常用固定节点域解析仍偶发偏慢，可在客户端本地 `[Host]` 手动绑定常用节点静态 IP（不写死进通用 `.conf` 模板）。
+7. **避免无必要的全量抓包/多余解密，按需关闭代理共享**：
+   - 仅保留配置末尾针对 Google `.cn` 的 `[MITM] hostname = *.google.cn` 与 `[URL Rewrite]`，不额外开启全局 HTTPS 解密，保证带宽与续航；
+   - 不需要用电脑或局域网其他设备借手机代理时，在 Shadowrocket **「设置 → 代理 → 代理共享」** 中关闭 HTTP/SOCKS 监听端口（如 `:1082`）。
 
-### 2. iOS 系统配套设置
-- **切换配置后必做动作**：每次导入或更新 `.conf` 后，开启手机 **「飞行模式」约 5 秒再关闭**，彻底清空 iOS 系统残留的 DNS 缓存。
+### 2. iOS 系统与局域网配套设置
+- **切换配置后清库重导与飞行模式清缓存（防 `ip:0` 静默失效）**：若此前导过含非规范 `IP-CIDR`（如宿主位非 0）的旧配置，建议先在 Shadowrocket **删除旧 `.conf`/对应 `.db` 缓存并彻底重导**；每次导入或更新 `.conf` 后开启手机 **「飞行模式」约 5 秒再关闭**，清空 iOS DNS 缓存，并在日志中核对启动摘要 `rule summary => ip:` 计数是否为非 0。
 - **删除外部加密 DNS 描述文件**：进入 **「设置 → 通用 → VPN 与设备管理」**，确认未安装第三方 DoH/DoT 加密 DNS 描述文件，否则 iOS 会跳过小火箭的 `hijack-dns = *:53`。
 - **关闭苹果隐私干扰项**：「设置 → iCloud / Safari」中关闭 **iCloud 专用代理（Private Relay）** 与 **隐藏 IP 地址 / 限制 IP 地址跟踪**，避免与小火箭接管打架。
+- **固定家庭局域网 IP 与 Wi-Fi MAC（稳定内网与省流）**：在家庭路由器为 iPhone 绑定 **静态 DHCP 租约**（与第 1 层 `bypass-tun` / 内网设备互访一致），并将 iOS **「设置 → 无线局域网 → 家庭 Wi-Fi 右侧 `i` → 私有无线局域网地址」** 设为 **「固定」**（避免定期轮换 MAC 导致路由器频繁重新分配 IP 及 ARP/NDP 刷新风暴）。
 - **高风控平台（如 Meta）额外建议**（按需）：若账号对环境一致性要求极高，还需关闭对应 App 的「定位服务」「通讯录权限」「后台 App 刷新」，并将系统「日期与时间」及「地区」调至与代理节点一致的地区（注：时区/地区属于系统行为，代理规则本身无法伪造）。
 
 ---
@@ -74,12 +82,12 @@
 ## 三、 上手后自测与日志排障标准流程
 
 1. **小火箭内置规则快速体检**：「配置」→ 点击 `.conf` 右侧 `i` → **「测试规则」**：
-   - `chatgpt.com` / `claude.ai` / `gemini.google.com` / `grok.com` / `events.statsigapi.net` → 应返回 **`PROXY`**
-   - `doubleclick.net` / `t7z.cupid.iqiyi.com` / `adjust.io` → 应返回 **`REJECT`**
-   - `apps.apple.com` / `icloud.com`（情况 A）与 `qishui.com` / `xiaohongshu.com` / `ieee.org` → 应返回 **`DIRECT`**
+   - `chatgpt.com` / `claude.ai` / `gemini.google.com` / `grok.com` / `kimi.ai` / `moonshot.ai` / `zoom.us` / `ieee.org` / `events.statsigapi.net` → 应返回 **`PROXY`**
+   - `doubleclick.net` / `adservice.google.com` / `t7z.cupid.iqiyi.com` / `adjust.io` / `browser-intake-datadoghq.com` / `o33249.ingest.sentry.io` / `csjplatform.com` → 应返回 **`REJECT`**
+   - `apps.apple.com` / `icloud.com`（情况 A）与 `qishui.com` / `xiaohongshu.com` / `windowsupdate.com` / `cn.bing.com` / `deepseek.com` → 应返回 **`DIRECT`**
 2. **检测站全面体检（`https://check.1ms.dog/zh-cn/`）**：
    - 合格状态：**DNS 无国内运营商泄露**（显示 `US` / 节点所在地）、**WebRTC Cloudflare 节点显示代理地**、**AI 检测全绿**、国内常规测试项（爱奇艺 / DNSPod 等）直连本地宽带低延迟。
    - 分享复查时使用页面 **「分享 → 复制链接」** 获取完整哈希短链或详情文本，卡片图片二维码仅含首页入口地址，不包含子项明细。
-   - **重要预期管理**：不要为了迎合检测站评分去打开 `ipv6: true`（易触发运营商 IPv6 泄露或黑洞卡死）或全局放行 QUIC（会恢复 `anytls` TCP 套 TCP 的双重重传卡顿）。
+   - **重要预期管理**：不要为了迎合检测站评分去打开 `ipv6: true`（易触发运营商 IPv6 泄露或黑洞卡死）或全局放行 QUIC（会恢复 TCP 代理节点套 QUIC 的双重拥塞重传卡顿）。
 3. **局域网跨机验证（可选深度实测）**：
-   - Shadowrocket 开启「设置 → 代理 → 代理共享 → 启用共享」（端口 `1082`），可在同局域网电脑上用 `curl -x http://<iPhone_IP>:1082 https://chatgpt.com/cdn-cgi/trace` 验证真实出口 IP；验证 `dns-*.db` / `proxy-*.db` 时重点检查：切换到新配置时刻之后，海外域名不应出现在 `dns.alidns.com` / `doh.pub` / 路由器 IP 记录中，高频漏进 `FINAL,PROXY` 的国内域名及时补充到第 8.1 层。
+   - Shadowrocket 开启「设置 → 代理 → 代理共享 → 启用共享」（端口 `1082`），可在同局域网电脑上用 `curl -x http://<iPhone_IP>:1082 https://chatgpt.com/cdn-cgi/trace` 验证真实出口 IP；验证 `dns-*.db` / `proxy-*.db` 时重点检查：切换到新配置时刻之后，海外域名不应出现在 `223.5.5.5` / `223.6.6.6` / 路由器 IP（以及旧配置遗留的 `dns.alidns.com` / `doh.pub`）记录中，高频漏进 `FINAL,PROXY` 的国内域名及时补充到第 8.1 层。
