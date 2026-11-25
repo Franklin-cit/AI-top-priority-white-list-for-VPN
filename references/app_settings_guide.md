@@ -79,7 +79,23 @@
 
 ---
 
-## 三、 上手后自测与日志排障标准流程
+## 三、 自建 VPS 的 Hysteria2（HY2）带宽设置建议
+
+`subscription-hardener` 不会硬编码或改写 `type: hysteria2` 节点的 `up` / `down` 字段（FlClash 原样透传 `--base` 中的节点参数，Shadowrocket 由节点详情页独立保存），请按实际网络环境填写：
+
+1. **核心原则（Brutal 拥塞控制）**：
+   - Hysteria2 的 `up`（上行）与 `down`（下行）决定 Brutal 发包速率上限，应按 **「本地宽带实测值」与「VPS 服务器端口上限」两者中的较小值再留出余量**，切勿留极大虚高值（虚高会导致晚高峰持续超发、高丢包卡顿，甚至触发运营商 UDP QoS 限速）；也不建议留空（留空会退回普通流控，削弱 HY2 在高丢包链路下的优势）。
+2. **推荐设置比例**：
+   - **上行 `up`**：取 `min(本地宽带上行, VPS 接收端口) × 80%–90%`（例如 100 Mbps 家宽上行通常设 `80–90 mbps`）。
+   - **下行 `down`**：取 `min(本地宽带下行, VPS 发送端口) × 65%–85%`；若晚高峰国际出口波动大、出现明显丢包或抖动，适当下调至晚高峰稳态吞吐附近（例如 300 Mbps 端口下调至 `180–220 mbps` 区间），可显著降低重传与卡顿。
+   - **移动蜂窝（4G / 5G）场景**：蜂窝上/下行波动远大于固定宽带，手机端建议比桌面端设置得更保守，或以 VLESS Reality 为主力、HY2 作为弱网/高丢包备用。
+3. **客户端填写方式**：
+   - **FlClash / Mihomo（`.yaml`）**：在 `--base` 的 `proxies:` 对应 `type: hysteria2` 节点下直接配置 `up: "<数值> mbps"` 与 `down: "<数值> mbps"`，构建脚本会自动原样保留。
+   - **Shadowrocket（iOS）**：首页点击对应 HY2 节点右侧 `i` → 填写 **上传带宽** 与 **下载带宽**（填纯数字，单位为 Mbps）。
+
+---
+
+## 四、 上手后自测与日志排障标准流程
 
 1. **小火箭内置规则快速体检**：「配置」→ 点击 `.conf` 右侧 `i` → **「测试规则」**：
    - `chatgpt.com` / `claude.ai` / `gemini.google.com` / `grok.com` / `kimi.ai` / `moonshot.ai` / `zoom.us` / `ieee.org` / `events.statsigapi.net` → 应返回 **`PROXY`**
